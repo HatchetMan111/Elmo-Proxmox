@@ -37,7 +37,7 @@
 set -Eeuo pipefail
 
 # ── Defaults ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="1.0.0"   # wird in --status/-Logs ausgegeben – hilft bei Fehlersuche
+INSTALLER_VERSION="1.0.1"   # wird in --status/-Logs ausgegeben – hilft bei Fehlersuche
 APP_NAME="elmo"
 UPSTREAM_OWNER="elmohq"
 UPSTREAM_REPO="elmo"
@@ -267,6 +267,43 @@ ensure_ct_running() {
         sleep 1
     done
     die "Container $ct_id hat nach 60 s keine IP (Bridge/Netz prüfen: pct exec $ct_id -- ip a)"
+}
+
+host_arch() {
+    # Host-Architektur auf die Template-Suffixe mappen (Live-Grube: auf einem
+    # x86-Host darf NIE ein arm64-Template gewählt werden, auch wenn es die
+    # neuere Versionsnummer trägt – ProxSmartHome 2026-11-22).
+    #  -m liefert x86_64/aarch64/... (nicht die Debian-Suffixe amd64/arm64!)
+    case "$(uname -m 2>/dev/null || echo "unbekannt")" in
+        x86_64)         echo "amd64" ;;
+        aarch64|arm64)  echo "arm64" ;;
+        *)              echo "" ;;
+    esac
+}
+
+verify_ct_started() {
+    # Exit-0-Täuschung (Live-Grube DatacenterManager/ProxSmartHome): `pct create
+    # --start 1` kann Exit 0 liefern, obwohl der Start intern scheitert
+    # ("Failed to spawn container" – u. a. bei Architektur-Mismatch des
+    # Templates). Deshalb: Status prüfen, bei Defekt einmal pct start mit
+    # sichtbarer Ausgabe versuchen und sonst mit KOMPLITTER Fehlerkette die().
+    local id="$1" state out=""
+    state=$(pct status "$id" 2>/dev/null | awk '{print $2}' || true)
+    if [[ "$state" == "running" ]]; then
+        ok "Container $id läuft (Status: running)"
+        return 0
+    fi
+    warn "Container $id läuft NICHT (Status: ${state:-unbekannt}) – 'pct create --start 1' hat es nicht gestartet."
+    info "Start-Versuch mit vollständiger Fehlerausgabe:"
+    out=$(pct start "$id" 2>&1 || true)
+    while IFS= read -r line; do
+        echo "    $line"
+    done <<< "$out"
+    if pct status "$id" 2>/dev/null | grep -q 'status: running'; then
+        warn "Container $id läuft nach manuellem pct start – fahre fort."
+        return 0
+    fi
+    die "Container $id startet nicht.\n  pct start sagte: ${out:-<keine Ausgabe>}\n  Häufigste Ursache: Template-Architektur ≠ Host-Architektur ($(uname -m) → $(host_arch || echo unbekannt)) – dies ist ein Installer-Bug, bitte melden.\n  Manuell prüfen: pct start $id && pct status $id && journalctl -u pveproxy -n 50"
 }
 
 # ── Argumente parsen ───────────────────────────────────────────────────────
@@ -875,20 +912,42 @@ do_install() {
     fi
 
     # Debian-Template sicherstellen (13 bevorzugt – Docker unterstützt trixie;
-    # rV-Sortierung nimmt 13 vor 12, Fallback bleibt)
+    # rV-Sortierung nimmt 13 vor 12, Fallback bleibt).
+    # WICHTIG: Arch-Filter! Auf einem Host können Templates FREMder Architektur
+    # im Cache liegen (Live-Grube ProxSmartHome 2026-11-22: arm64-Template mit
+    # NEUERER Versionsnummer als das passende amd64 → Spawn-Fehler). Deshalb
+    # wird zuerst auf die Host-Architektur gefiltert, dann versionssortiert.
     header "🧱 Container-Template"
-    local template=""
-    template=$(pveam list local 2>/dev/null | awk '{print $1}' | grep -o 'debian-1[23]-standard[^ ]*' | sort -rV | head -1 || true)
+    local arch template="" t_arch
+    arch=$(host_arch)
+    if [[ -z "$arch" ]]; then
+        die "Host-Architektur $(uname -m) wird nicht unterstützt (amd64/arm64 erwartet)."
+    fi
+    info "Host-Architektur: $(uname -m) → Template-Suffix '${arch}'"
+
+    template=$(pveam list local 2>/dev/null | awk '{print $1}' \
+        | grep -o "debian-1[23]-standard[^ ]*_${arch}\\.tar[^ ]*" | sort -rV | head -1 || true)
     if [[ -z "$template" ]]; then
-        info "Kein Debian-12/13-Template vorhanden – lade es herunter ..."
+        info "Kein passendes Debian-12/13-Template (${arch}) vorhanden – lade es herunter ..."
         pveam update
-        template=$(pveam available --section system 2>/dev/null | grep -o 'debian-1[23]-standard[^ ]*' | sort -rV | head -1 || true)
+        template=$(pveam available --section system 2>/dev/null \
+            | grep -o "debian-1[23]-standard[^ ]*_${arch}\\.tar[^ ]*" | sort -rV | head -1 || true)
         if [[ -z "$template" ]]; then
-            die "Kein debian-12/13-standard-Template gefunden (pveam available leer?)."
+            die "Kein debian-12/13-standard-Template für ${arch} gefunden (pveam available leer?)."
         fi
         pveam download local "$template"
     fi
     ok "Template: $template"
+
+    # Gegenprobe: geladenes Template muss zur Host-Architektur passen – falls
+    # pveam (unerwartet) ein Fremd-Arch-Template liefert, hier hart abbrechen
+    # statt später mit kryptischem Spawn-Fehler.
+    # (Nicht mit tr -d '_.tar' arbeiten – das löscht die Zeichen einzeln!)
+    t_arch="${template%.tar*}"      # debian-13-standard_13.6-1_amd64
+    t_arch="${t_arch##*_}"          # amd64
+    if [[ "$t_arch" != "$arch" ]]; then
+        die "Template '${template}' passt nicht zur Host-Architektur ($(uname -m) → ${arch}).\n  Bitte ein ${arch}-Template bereitstellen: pveam available --section system | grep ${arch}"
+    fi
 
     # ID & Passwort
     if [[ -z "$CT_ID" ]]; then
@@ -939,7 +998,9 @@ do_install() {
         --start 1 \
         --password "$CT_PASSWORD" \
         "${ssh_keys_args[@]}"
-    ok "Container $CT_ID erstellt und gestartet"
+    # pct create kann trotz intern fehlgeschlagenem Start Exit 0 liefern –
+    # deshalb der explizite Status-Check mit Fehlerausgabe (Grube 10/Exit-0).
+    verify_ct_started "$CT_ID"
 
     wait_for_ct_network "$CT_ID"
     verify_ct_dns "$CT_ID"

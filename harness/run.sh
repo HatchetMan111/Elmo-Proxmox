@@ -27,6 +27,7 @@ VER="0.7.12"                         # Image-Pin (wie im Installer als Default)
 echo "$CT_IP" > "$HS/ct_ip"
 : > "$HS/ct_list"                    # Zeilen: "VMID Status Lock-Name(=Name letztes Feld)"
 echo "getent_mode=ok" > "$HS/getent_mode"
+echo "x86_64" > "$HS/host_arch"       # Host-Architektur (uname -m-Mock); "aarch64" = Fremd-Arch-Falle
 
 PASSED=0; FAILED=0; CUR_NAME=""; CUR_DIR=""
 
@@ -93,10 +94,11 @@ link_real() { # echte Binaries per Symlink verfügbar halten (Shadowing via PATH
 }
 link_real "$HOSTBIN" bash sh env awk sed grep cut head tail tr od mktemp tee openssl \
     seq cat mv cp rm mkdir chmod dirname basename sort uniq readlink date printf ls touch \
-    stat id uname hostname
+    stat id hostname
 ln -sf "$MK/mock-curl"  "$HOSTBIN/curl"
 ln -sf "$MK/mock-pct"   "$HOSTBIN/pct"
 ln -sf "$MK/mock-pveam" "$HOSTBIN/pveam"
+ln -sf "$MK/mock-uname" "$HOSTBIN/uname"
 ln -sf "$MK/mock-sleep" "$HOSTBIN/sleep"
 ln -sf "$MK/mock-sleep" "$INNERBIN/sleep"
 
@@ -123,6 +125,17 @@ unseed_inner_tools() {
 # ══════════════════════════ Mock-Binaries ══════════════════════════════════
 cat > "$MK/mock-sleep" <<'EOF'
 #!/usr/bin/env bash
+exit 0
+EOF
+
+cat > "$MK/mock-uname" <<'EOF'
+#!/usr/bin/env bash
+# uname-Mock: Host-Architektur aus $HS/host_arch – echter uname -m-Wert
+# (x86_64 | aarch64 | other); der Installer mappt selbst auf Template-Suffixe.
+set -u
+HS="${HARNESS_STATE:?}"
+arch=$(/bin/cat "$HS/host_arch" 2>/dev/null || echo "x86_64")
+echo "$arch"
 exit 0
 EOF
 
@@ -156,6 +169,22 @@ case "$cmd" in
             echo "mock: Template $tmpl nicht vorhanden" >&2; exit 2
         fi
         { echo "TEMPLATE=$tmpl"; echo "ARGS=$*"; } > "$HS/ct_${id}.create"
+        # Exit-0-Täuschung simulieren: create meldet Erfolg, aber der Start
+        # scheitert intern ("Failed to spawn container") – Status bleibt stopped.
+        if [[ -f "$HS/create_spawn_fail" ]]; then
+            echo "sync_wait: 34 An error occurred in another process (expected sequence number 7)" >&2
+            echo '__lxc_start: 2127 Failed to spawn container "'"$id"'"' >&2
+            hostname="ct-$id"
+            prev=""
+            for a in "$@"; do
+                if [[ "$prev" == "--hostname" ]]; then hostname="$a"; fi
+                prev="$a"
+            done
+            echo "$id stopped $hostname" >> "$HS/ct_list"
+            echo "stopped" > "$HS/ct_${id}.status"
+            echo "$hostname" > "$HS/ct_${id}.hostname"
+            exit 0
+        fi
         hostname="ct-$id"
         prev=""
         for a in "$@"; do
@@ -168,6 +197,13 @@ case "$cmd" in
         exit 0 ;;
     start)
         [[ -f "$HS/ct_${id}.status" ]] || { echo "mock: CT $id unbekannt" >&2; exit 2; }
+        # pct-Mock: bei create_spawn_fail bleibt der Start ebenfalls verweigert
+        # (spawn-fail-Simulation – pct create log, pct start scheitert sichtbar)
+        if [[ -f "$HS/create_spawn_fail" ]]; then
+            echo "sync_wait: 34 An error occurred in another process (expected sequence number 7)" >&2
+            echo '__lxc_start: 2127 Failed to spawn container "'"$id"'"' >&2
+            exit 1
+        fi
         echo "running" > "$HS/ct_${id}.status"
         /bin/sed -i "s|^$id .*|$id running $(cat "$HS/ct_${id}.hostname" 2>/dev/null || echo ct-$id)|" "$HS/ct_list"
         exit 0 ;;
@@ -241,25 +277,49 @@ EOF
 
 cat > "$MK/mock-pveam" <<'EOF'
 #!/usr/bin/env bash
+# pveam-Mock: Templates je Host-Architektur ($HS/host_arch):
+#  - host_arch=amd64 → list/available liefern ein amd64-Template
+#    (debian-13-standard_13.6-1_amd64) UND ein NEUERES arm64-Template
+#    (debian-13-standard_13.9-1_arm64) – der Installer MUSS das arm64
+#    ignorieren (Live-Grube ProxSmartHome 2026-11-22: genau dieser Fall!)
+#  - host_arch=arm64 → nur arm64-Templates
+#  - host_arch=other → nur amd64 (odgefiltert wird trotzdem nichts passen)
+#  - pveam_empty        → nichts vorhanden (Download-Pfad)
 set -u
 HS="${HARNESS_STATE:?}"
 echo "pveam $*" >> "$HS/calls.log"
-TMPL="local:vztmpl/debian-13-standard_13.2-1_amd64.tar.zst"
+ARCH=$(/bin/cat "$HS/host_arch" 2>/dev/null || echo "amd64")
 case "${1:-}" in
     list)
         if [[ -f "$HS/template_downloaded" && ! -f "$HS/pveam_empty" ]]; then
-            echo "$TMPL  123456789"
+            if [[ "$ARCH" == "arm64" ]]; then
+                echo "debian-13-standard_13.9-1_arm64.tar.zst  123456789"
+            else
+                # amd64-Host: passendes amd64 + FREMDES, NEUERES arm64-Template
+                echo "debian-13-standard_13.6-1_amd64.tar.zst  123456789"
+                echo "debian-13-standard_13.9-1_arm64.tar.zst  123456789"
+            fi
         fi
         exit 0 ;;
     available)
         if [[ ! -f "$HS/pveam_empty" ]]; then
-            echo "system          $TMPL  123456789"
+            if [[ "$ARCH" == "arm64" ]]; then
+                echo "system          debian-13-standard_13.9-1_arm64.tar.zst  123456789"
+            else
+                echo "system          debian-13-standard_13.6-1_amd64.tar.zst  123456789"
+                echo "system          debian-13-standard_13.9-1_arm64.tar.zst  123456789"
+            fi
         fi
         exit 0 ;;
     update)   exit 0 ;;
     download)
         mkdir -p "$HS/templates"
-        touch "$HS/templates/debian-13-standard_13.2-1_amd64.tar.zst"
+        # passendes Template zur Host-Arch "herunterladen"
+        if [[ "$ARCH" == "arm64" ]]; then
+            touch "$HS/templates/debian-13-standard_13.9-1_arm64.tar.zst"
+        else
+            touch "$HS/templates/debian-13-standard_13.6-1_amd64.tar.zst"
+        fi
         touch "$HS/template_downloaded"
         exit 0 ;;
 esac
@@ -461,6 +521,7 @@ reset_state() {
     echo "$CT_IP" > "$HS/ct_ip"
     : > "$HS/ct_list"
     echo "getent_mode=ok" > "$HS/getent_mode"
+    echo "x86_64" > "$HS/host_arch"   # uname -m-Mock (x86_64 | aarch64)
     unseed_inner_tools   # Inner-Fakebin wieder auf "nacktes Debian" zurücksetzen
 }
 run_installer() {
@@ -498,7 +559,7 @@ seed_ct() { # laufender CT mit installiertem Stack
     mkdir -p "$MK/opt/elmo" "$MK/etc/systemd/system" "$MK/etc" "$MK/var/log"
     seed_inner_tools
     touch "$HS/stack_up" "$HS/elmo_active" "$HS/template_downloaded"
-    touch "$HS/templates/debian-13-standard_13.2-1_amd64.tar.zst"
+    touch "$HS/templates/debian-13-standard_13.6-1_amd64.tar.zst"
     touch "$MK/etc/systemd/system/elmo.service"
     cat > "$MK/opt/elmo/.env" <<ENVSEED
 DEPLOYMENT_MODE=local
@@ -557,7 +618,7 @@ reset_state
 printf '200 running foo\n201 running bar\n202 running baz\n' > "$HS/ct_list"
 seed_inner_tools
 touch "$HS/template_downloaded"
-touch "$HS/templates/debian-13-standard_13.2-1_amd64.tar.zst"
+touch "$HS/templates/debian-13-standard_13.6-1_amd64.tar.zst"
 ec=$(run_installer); assert_exit 0 "$ec"
 assert_out "Nächste freie CT-ID: 203"
 assert_fcontains "$HS/ct_203.create" "hostname elmo"
@@ -579,7 +640,7 @@ reset_state
 ec=$(run_installer); assert_exit 0 "$ec"
 assert_out "Container-IP: $CT_IP"
 assert_out "DNS im Container funktioniert (3x bestätigt)"
-assert_out "debian-13-standard_13.2"
+assert_out "debian-13-standard_13.6-1_amd64"
 assert_fcontains "$HS/ct_200.create" "unprivileged"
 assert_fcontains "$HS/ct_200.create" "nesting=1,keyctl=1"
 assert_fcontains "$HS/ct_200.create" "onboot 1"
@@ -717,11 +778,56 @@ echo "running" > "$HS/ct_200.status"
 echo "elmo" > "$HS/ct_200.hostname"
 seed_inner_tools
 touch "$HS/template_downloaded"
-touch "$HS/templates/debian-13-standard_13.2-1_amd64.tar.zst"
+touch "$HS/templates/debian-13-standard_13.6-1_amd64.tar.zst"
 ec=$(run_installer --force); assert_exit 0 "$ec"
 assert_calls 1 "pct destroy 200 --purge"
 assert_out "neu an"
 assert_fcontains "$HS/ct_200.create" "hostname elmo"
+
+t "Arch-Filter: amd64-Host ignoriert NEUERES arm64-Template (Live-Grube 2026-11-22)"
+reset_state
+seed_inner_tools
+touch "$HS/template_downloaded"
+touch "$HS/templates/debian-13-standard_13.6-1_amd64.tar.zst"
+# pveam list liefert: amd64 (13.6) + arm64 (13.9, neuer) – der Installer DARF
+# nicht das arm64 nehmen, sonst Spawn-Fehler.
+ec=$(run_installer); assert_exit 0 "$ec"
+assert_out "Host-Architektur: x86_64 → Template-Suffix 'amd64'"
+assert_out "Template: debian-13-standard_13.6-1_amd64.tar.zst"
+assert_out "Container 200 läuft (Status: running)"
+assert_fcontains "$HS/ct_200.create" "debian-13-standard_13.6-1_amd64.tar.zst"
+
+t "Arch-Filter: Download-Pfad ignoriert Fremd-Arch (kein Template im Cache)"
+reset_state
+# Kein template_downloaded → Download-Pfad: pveam available liefert amd64+arm64,
+# der Installer muss das amd64 nehmen und herunterladen.
+ec=$(run_installer); assert_exit 0 "$ec"
+assert_out "lade es herunter"
+assert_fcontains "$HS/ct_200.create" "debian-13-standard_13.6-1_amd64.tar.zst"
+
+t "Arch-Filter: arm64-Host bekommt arm64-Template"
+reset_state
+echo "aarch64" > "$HS/host_arch"
+seed_inner_tools
+touch "$HS/template_downloaded"
+touch "$HS/templates/debian-13-standard_13.9-1_arm64.tar.zst"
+ec=$(run_installer); assert_exit 0 "$ec"
+assert_out "Template-Suffix 'arm64'"
+assert_out "Template: debian-13-standard_13.9-1_arm64.tar.zst"
+assert_fcontains "$HS/ct_200.create" "debian-13-standard_13.9-1_arm64.tar.zst"
+
+t "verify_ct_started: pct create Exit-0-Täuschung (spawn fail) → die() mit Fehlerkette"
+reset_state
+seed_inner_tools
+touch "$HS/template_downloaded"
+touch "$HS/templates/debian-13-standard_13.6-1_amd64.tar.zst"
+touch "$HS/create_spawn_fail"
+ec=$(run_installer); assert_exit 1 "$ec"
+assert_out "Container 200 läuft NICHT (Status: stopped)"
+assert_out "Failed to spawn container"
+assert_out "Start-Versuch mit vollständiger Fehlerausgabe"
+assert_out "pct start sagte:"
+assert_out "pct start 200 && pct status 200"
 
 t "Install: pct create schlägt fehl → komplette Fehlerkette + --debug-Hinweis"
 reset_state
