@@ -37,7 +37,7 @@
 set -Eeuo pipefail
 
 # ── Defaults ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="1.0.1"   # wird in --status/-Logs ausgegeben – hilft bei Fehlersuche
+INSTALLER_VERSION="1.0.2"   # wird in --status/-Logs ausgegeben – hilft bei Fehlersuche
 APP_NAME="elmo"
 UPSTREAM_OWNER="elmohq"
 UPSTREAM_REPO="elmo"
@@ -62,10 +62,12 @@ CT_PASSWORD=""              # leer = automatisch generieren
 CT_SSHKEY=""                # Pfad ODER URL zu einer Public-Key-Datei (optional)
 SSH_KEY_FILE=""             # aufgelöste Key-Datei für pct create
 UI_PORT=1515                # Web-UI-Host-Port (Default der offiziellen elmo-CLI)
-SCRAPE_TARGETS_DEFAULT="chatgpt:openrouter:openai/gpt-5-mini:online"
-                            # Worker braucht beim Boot eine GÜLTIGE SCRAPE_TARGETS-
-                            # Syntax (sonst Crash-Loop) – Default ist syntaktisch ok;
-                            # echte Abfragen brauchen zusätzlich einen API-Key in .env
+SCRAPE_TARGETS_DEFAULT="stub:main:stub:online"
+                            # Default = der KEYLESS-"stub"-Provider ("no network",
+                            # antwortet mit dem Prompt selbst) – der Worker bootet
+                            # damit OHNE API-Keys garantiert (Live-Grube 2026-11-22:
+                            # "provider openrouter requires API key(s)" → Crash-Loop).
+                            # Echte Targets: --scrape-targets + --openrouter-key o. Keys
 SCRAPE_TARGETS=""           # leer = Default oben (Flag --scrape-targets überschreibt)
 OPENROUTER_API_KEY=""       # optional per Flag; Nachrüstung jederzeit in .env
 TELEMETRY=false             # DISABLE_TELEMETRY=1 (Elmo sammelt sonst anonyme Telemetrie)
@@ -591,8 +593,9 @@ fi
 [[ -n "$(dotenv_get VITE_APP_NAME)" ]]   || dotenv_set VITE_APP_NAME "Elmo"
 [[ -n "$(dotenv_get VITE_APP_ICON)" ]]   || dotenv_set VITE_APP_ICON "/icons/elmo-icon.svg"
 [[ -n "$(dotenv_get DATABASE_URL)" ]]    || dotenv_set DATABASE_URL "postgres://postgres:postgres@postgres:5432/elmo"
-# APP_URL wird unten (sync-app-url.sh) auf die aktuelle CT-IP gesetzt bzw.
-# aktualisiert – nur der ERSTE Eintrag kommt hier als Fallback rein:
+# APP_URL wird unten (sync-app-url.sh) auf http://127.0.0.1:<PORT> gepinnt –
+# das ist der Loopback, den die MCP-Auth akzeptiert (siehe sync-app-url.sh).
+# Nur der ERSTE Eintrag kommt hier als Fallback rein:
 [[ -n "$(dotenv_get APP_URL)" ]]         || dotenv_set APP_URL "http://127.0.0.1:${UI_PORT}"
 [[ -n "$(dotenv_get VITE_APP_URL)" ]]    || dotenv_set VITE_APP_URL "http://127.0.0.1:${UI_PORT}"
 # Telemetrie: AUS ist Default (--telemetry erlaubt sie). Leerer Wert = erlaubt,
@@ -621,14 +624,21 @@ chmod 600 .env
 echo ">>> Compose-Konfiguration validieren ..."
 docker compose config -q || die "docker compose config meldet Fehler (Compose-Datei/.env prüfen).\n  Debug: cd $APP_DIR && docker compose config"
 
-echo ">>> APP-URL-Sync-Script schreiben (passt .env bei IP-Wechsel an) ..."
+echo ">>> APP-URL-Sync-Script schreiben (Loopback-Pinning, kein IP-Sync) ..."
+# Live-Grube 2026-11-22: elmo-web BOOTET NICHT mit einer plain-http-IP als
+# APP_URL – die MCP-Auth (better-auth) verlangt für die Resource-ID zwingend
+# https:// ODER localhost/127.x ( packages/lib/src/auth/server.ts:mcpResource ).
+# NODE_ENV=production ist im Image fix, "localhost" greift also nicht als
+# localOrigin. Lösung: APP_URL auf http://127.0.0.1:<PORT> pinnen – das ist
+# loopback-akzeptiert, web bootet, und die UI ist trotzdem von außen erreichbar
+# (Browser lädt nur HTML+Assets; relative Pfade bleiben relativ). Wer den
+# MCP-Server braucht, setzt in .env eine https://-Domain – dann greift der
+# Domain-Modus hier nicht mehr (Sync bleibt unverändert).
 cat > "${APP_DIR}/sync-app-url.sh" <<SYNCEOF
 #!/usr/bin/env bash
-# Synchronisiert die IP-abhängigen Einträge in .env mit der aktuellen CT-IP.
-# Läuft als ExecStartPre vor jedem Elmo-Start – DHCP-IP-Hüpfer brechen damit
-# die APP_URL nicht mehr (wird u. a. als HTTP-Referer und für OG-Images
-# genutzt). Domain-Modus: beginnt APP_URL mit https://, greift der Sync NICHT
-# mehr (Reverse-Proxy/Domain-Eintrag bleibt erhalten).
+# Pinnt APP_URL/VITE_APP_URL auf den Loopback-Port (http://127.0.0.1:<PORT>),
+# damit elmo-web überhaupt startet (MCP braucht https ODER loopback).
+# Domain-Modus: beginnt APP_URL mit https://, greift NICHTS (Sync macht nichts).
 set -euo pipefail
 SELF_DIR=\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)
 cd "\$SELF_DIR"
@@ -641,15 +651,13 @@ set_key() { # KEY VALUE – ersetzen oder anhängen (idempotent)
 }
 CURRENT=\$(sed -n 's/^APP_URL=//p' .env 2>/dev/null | head -1 || true)
 case "\$CURRENT" in
-    https://*) echo "elmo-sync: Domain-Modus (APP_URL=\$CURRENT) – kein IP-Sync"; exit 0 ;;
+    https://*) echo "elmo-sync: Domain-Modus (APP_URL=\$CURRENT) – kein Pinning"; exit 0 ;;
 esac
-IP=\$(ip -4 addr show eth0 scope global 2>/dev/null | awk '/inet /{print \$2; exit}' | cut -d/ -f1 || true)
-[[ -n "\$IP" ]] || { echo "elmo-sync: keine globale IPv4 an eth0 – .env bleibt unverändert"; exit 0; }
-WANT="http://\${IP}:${UI_PORT}"
+WANT="http://127.0.0.1:${UI_PORT}"
 if [[ "\$CURRENT" != "\$WANT" ]]; then
-    echo "elmo-sync: CT-IP geändert (\${CURRENT:-unbekannt} → \${IP}) – aktualisiere .env"
+    echo "elmo-sync: APP_URL=\${CURRENT:-unbekannt} → \$WANT (Loopback-Pin)"
 else
-    echo "elmo-sync: CT-IP unverändert (\${IP})"
+    echo "elmo-sync: APP_URL unverändert (\$WANT)"
 fi
 set_key APP_URL "\$WANT"
 set_key VITE_APP_URL "\$WANT"
@@ -717,11 +725,12 @@ ok "Web-UI antwortet (HTTP ${code})"
 echo ">>> Prüfe Worker-Status (verarbeitet die Abfrage-Jobs) ..."
 ps_out=$(docker compose ps --format '{{.Service}} {{.State}}' 2>/dev/null || true)
 if /bin/grep -q '^worker running$' <<<"$ps_out" 2>/dev/null; then
-    ok "Worker läuft (SCRAPE_TARGETS-Syntax ist gültig)"
+    ok "Worker läuft (SCRAPE_TARGETS ist gültig und key-fähig)"
 else
     warn "Worker läuft nicht (Status prüfen) – Web-UI funktioniert trotzdem."
-    warn "Häufigste Ursache: ungültige SCRAPE_TARGETS-Syntax in .env oder"
-    warn "fehlender Provider-Key. Logs: docker compose logs --tail 50 worker"
+    warn "Häufigste Ursache: SCRAPE_TARGETS nennt einen Provider ohne Key"
+    warn "(z. B. openrouter ohne OPENROUTER_API_KEY – der bootet dann nicht)."
+    warn "Logs: docker compose logs --tail 50 worker"
 fi
 
 echo ">>> Aufräumen ..."
@@ -857,7 +866,8 @@ print_summary() {
     echo -e "  ${CYAN}Erste Schritte:${NC}"
     echo "  1. http://${ct_ip}:${UI_PORT} öffnen und im Onboarding die erste"
     echo "     Marke (+ Wettbewerber) anlegen"
-    echo "  2. Provider-Keys hinterlegen (ohne Keys laufen keine Abfragen!):"
+    echo "  2. Provider-Keys hinterlegen (ohne Keys läuft der Worker im"
+    echo "     Stub-Modus: 'no network', antwortet nur mit dem Prompt selbst!):"
     echo "     - OpenRouter (Judge-Modell + Onboarding + Opportunities):"
     echo "         pct exec ${CT_ID} -- sed -i 's|^OPENROUTER_API_KEY=.*|OPENROUTER_API_KEY=sk-or-...|' ${APP_DIR}/.env"
     echo "       oder beim Installer:  ${ONE_LINER} --update --openrouter-key sk-or-..."
@@ -865,11 +875,17 @@ print_summary() {
     echo "       z. B. Cloro, BrightData, SearchApi, Olostep, Oxylabs – Key in"
     echo "       ${APP_DIR}/.env ergänzen (KEY-Namen im README), dann:"
     echo "         ${ONE_LINER} --update"
-    echo "  3. SCRAPE_TARGETS anpassen (welche Engines getrackt werden):"
-    echo "         ${ONE_LINER} --update --scrape-targets \"chatgpt:openrouter:openai/gpt-5-mini:online,google-ai-mode:openrouter:openai/gpt-5-mini:online\""
+    echo "  3. SCRAPE_TARGETS anpassen (welche Engines getrackt werden) –"
+    echo "     aktuell Default 'stub:main' (keyless). Beispiel mit echtem Target:"
+    echo "         ${ONE_LINER} --update --openrouter-key sk-or-... --scrape-targets \"chatgpt:openrouter:openai/gpt-5-mini:online\""
+    echo "     (WICHTIG: jeder Provider in SCRAPE_TARGETS braucht seinen Key,"
+    echo "      sonst bootet der Worker nicht – siehe README.)"
     echo ""
     echo -e "  ${CYAN}MCP-Server (für Claude & Co.):${NC}"
-    echo "  Nach dem Start erreichbar unter http://${ct_ip}:${UI_PORT}/api/mcp"
+    echo "  Die Web-UI läuft; der MCP-Endpunkt http://${ct_ip}:${UI_PORT}/api/mcp"
+    echo "  braucht eine https://-APP_URL (oder localhost) – setze dafür in"
+    echo "  ${APP_DIR}/.env APP_URL=https://deine-domain.example (Reverse-Proxy),"
+    echo "  der Loopback-Pin greift dann nicht mehr."
     echo ""
     echo -e "  ${CYAN}Nützliche Befehle (exakt kopierbar):${NC}"
     echo "  Status:    ${ONE_LINER} --status"
@@ -881,8 +897,8 @@ print_summary() {
     warn "postgres_data im CT – ein --update erhält sie, pct destroy löscht sie."
     warn "Für Backups: pct backup / vzdump."
     if [[ "$CT_IP" == "dhcp" ]]; then
-        warn "CT hat DHCP – bei IP-Wechsel sync'd das System die APP_URL beim Boot"
-        warn "selbst, trotzdem empfohlen: DHCP-Reservierung im Router (oder --ip)."
+        warn "CT hat DHCP – die APP_URL ist auf 127.0.0.1 gepinnt (unabhängig"
+        warn "von der CT-IP); trotzdem empfohlen: DHCP-Reservierung im Router."
     fi
 }
 

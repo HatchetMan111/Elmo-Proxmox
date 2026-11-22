@@ -68,13 +68,29 @@ bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/Elmo-Prox
 ```
 
 `SCRAPE_TARGETS` bestimmt, welche Engines getrackt werden (Format
-`modell:provider[:version][:online]`, kommasepariert). Default:
-`chatgpt:openrouter:openai/gpt-5-mini:online` – **der Worker braucht eine gültige
-Syntax beim Boot** (sonst Crash-Loop), änderbar per:
+`modell:provider[:version][:online]`, kommasepariert). Default: **`stub:main`**
+(der keyless-„Stub“-Provider – der Worker bootet damit garantiert ohne API-Keys,
+antwortet aber nur mit dem Prompt selbst, „no network“). **Wichtig:** Jeder
+Provider in `SCRAPE_TARGETS` braucht beim Boot seinen Key (sonst verweigert der
+Worker den Start und crash-looped). Echte Targets:
 
 ```bash
-... " --update --scrape-targets "chatgpt:openrouter:openai/gpt-5-mini:online,google-ai-mode:openrouter:openai/gpt-5-mini:online"
+# Ein Target mit OpenRouter-Key (Judge + Onboarding laufen damit auch):
+... " --update --openrouter-key sk-or-v1-... \
+    --scrape-targets "chatgpt:openrouter:openai/gpt-5-mini:online,google-ai-mode:openrouter:openai/gpt-5-mini:online"
 ```
+
+## Web-UI & APP_URL (Loopback-Pin)
+
+`APP_URL` wird vom Installer auf `http://127.0.0.1:<PORT>` **gepinnt** (nicht
+die CT-IP) – Grund: elmo-web startet sonst nicht (die MCP-Auth verlangt für
+ihre Resource-ID zwingend `https://` **oder** `localhost`/`127.x`; im Container
+ist `NODE_ENV=production`, „localhost“ greift also nicht). Die Web-UI ist
+trotzdem von außen erreichbar (Browser lädt nur HTML+Assets, relative Pfade
+bleiben relativ). Für den **MCP-Server** (`/api/mcp`) oder saubere Links
+`APP_URL=https://deine-domain.example` in `/opt/elmo/.env` setzen
+(Reverse-Proxy/TLS) – der Loopback-Pin erkennt `https://` und greift dann nicht
+mehr.
 
 ## Update
 
@@ -104,7 +120,7 @@ Exit-Code, Log-Auszüge, Container-Logs) und bleibt zur Inspektion stehen
 ```
 ┌─ LXC „elmo“ (unprivileged, Docker-in-LXC) ─────────────────┐
 │  systemd: elmo.service (Restart=always, ExecStartPre       │
-│            sync-app-url.sh → APP_URL = aktuelle CT-IP)     │
+│            sync-app-url.sh → APP_URL = 127.0.0.1-Pin)      │
 │                                                            │
 │  docker compose (name: elmo):                              │
 │   postgres   postgres:18-alpine      intern (KEIN Expose)  │
@@ -120,7 +136,7 @@ Exit-Code, Log-Auszüge, Container-Logs) und bleibt zur Inspektion stehen
 ## Domain-Modus (Reverse-Proxy, optional)
 
 Setze in `/opt/elmo/.env` `APP_URL=https://elmo.beispiel.de` (und `VITE_APP_URL`
-ebenso) – der IP-Sync beim Boot erkennt `https://` und greift dann **nicht mehr**,
+ebenso) – der Loopback-Pin beim Boot erkennt `https://` und greift dann **nicht mehr**,
 deine Domain bleibt erhalten. Dahinter kannst du einen Reverse-Proxy deiner Wahl
 hängen.
 
