@@ -571,8 +571,9 @@ APP_ICON=/icons/elmo-icon.svg
 VITE_APP_NAME=Elmo
 VITE_APP_ICON=/icons/elmo-icon.svg
 DATABASE_URL=postgres://postgres:postgres@postgres:5432/elmo
-APP_URL=http://127.0.0.1:1515
-VITE_APP_URL=http://127.0.0.1:1515
+APP_URL=http://10.120.5.42:1515
+VITE_APP_URL=http://10.120.5.42:1515
+BETTER_AUTH_URL=http://127.0.0.1:1515
 DISABLE_TELEMETRY=1
 SCRAPE_TARGETS=chatgpt:cloro:online,google-ai-mode:cloro:online
 ENVSEED
@@ -690,8 +691,9 @@ assert_fcontains "$ENV_PATH" "APP_ICON=/icons/elmo-icon.svg"
 assert_fcontains "$ENV_PATH" "DATABASE_URL=postgres://postgres:postgres@postgres:5432/elmo"
 assert_fcontains "$ENV_PATH" "DISABLE_TELEMETRY=1"
 assert_fcontains "$ENV_PATH" "SCRAPE_TARGETS=stub:main:stub:online"
-assert_fregex "$ENV_PATH" '^APP_URL=http://127.0.0.1:1515$'
-assert_fregex "$ENV_PATH" '^VITE_APP_URL=http://127.0.0.1:1515$'
+assert_fregex "$ENV_PATH" '^APP_URL=http://'"$CT_IP"':1515$'
+assert_fregex "$ENV_PATH" '^VITE_APP_URL=http://'"$CT_IP"':1515$'
+assert_fregex "$ENV_PATH" '^BETTER_AUTH_URL=http://127.0.0.1:1515$'
 assert_no_fcontains "$ENV_PATH" "OPENROUTER_API_KEY"
 env_mode=$(/bin/stat -c '%a' "$ENV_PATH" 2>/dev/null || echo "?")
 if [[ "$env_mode" == "600" ]]; then pass ".env chmod 600"
@@ -707,18 +709,21 @@ assert_fcontains "$UNIT_PATH" "After=network-online.target docker.service"
 assert_fcontains "$UNIT_PATH" "Requires=docker.service"
 assert_fcontains "$UNIT_PATH" "WantedBy=multi-user.target"
 
-t "Sync-Script: Loopback-Pinning + Domain-Guard"
+t "Sync-Script: APP_URL=IP + BETTER_AUTH_URL=Loopback + Domain-Guard"
 assert_file "$SYNC_PATH"
 assert_fcontains "$SYNC_PATH" 'BASH_SOURCE[0]'
-assert_fcontains "$SYNC_PATH" "127.0.0.1"   # APP_URL wird auf Loopback gepinnt
+assert_fcontains "$SYNC_PATH" "127.0.0.1"   # BETTER_AUTH_URL wird auf Loopback gepinnt
 assert_fcontains "$SYNC_PATH" "https://*"    # https://-APP_URL wird nicht überschrieben
 assert_fcontains "$SYNC_PATH" "set_key APP_URL"
+assert_fcontains "$SYNC_PATH" "set_key BETTER_AUTH_URL"
+assert_fcontains "$SYNC_PATH" "eth0"         # APP_URL = echte CT-IP-Origin
 
 t "Install mit --port 4545"
 reset_state
 ec=$(run_installer --port 4545); assert_exit 0 "$ec"
 assert_fcontains "$COMPOSE_PATH" '"4545:3000"'
-assert_fregex "$ENV_PATH" '^APP_URL=http://127.0.0.1:4545$'
+assert_fregex "$ENV_PATH" '^APP_URL=http://'"$CT_IP"':4545$'
+assert_fregex "$ENV_PATH" '^BETTER_AUTH_URL=http://127.0.0.1:4545$'
 assert_out "http://$CT_IP:4545"
 
 t "Install mit --telemetry"
@@ -767,7 +772,16 @@ echo "192.168.178.77" > "$HS/ct_ip"   # mock-ip/sync liefert die statische IP
 ec=$(run_installer --ip 192.168.178.77/24 --gateway 192.168.178.1); assert_exit 0 "$ec"
 assert_fcontains "$HS/ct_200.create" "ip=192.168.178.77/24,gateway=192.168.178.1"
 assert_out "http://192.168.178.77:1515"
-assert_fregex "$ENV_PATH" '^APP_URL=http://127.0.0.1:1515$'
+assert_fregex "$ENV_PATH" '^APP_URL=http://192.168.178.77:1515$'
+assert_fregex "$ENV_PATH" '^BETTER_AUTH_URL=http://127.0.0.1:1515$'
+
+t "Invalid-origin-Regression: APP_URL = echte CT-IP, BETTER_AUTH_URL = Loopback"
+reset_state
+ec=$(run_installer); assert_exit 0 "$ec"
+# Better Auth vertraut der echten Origin (Login vom LAN), MCP sieht Loopback:
+assert_fregex "$ENV_PATH" '^APP_URL=http://'"$CT_IP"':1515$'
+assert_fregex "$ENV_PATH" '^BETTER_AUTH_URL=http://127.0.0.1:1515$'
+assert_no_fcontains "$ENV_PATH" "APP_URL=http://127.0.0.1"
 
 t "Install: Web-UI antwortet mit 302 (Redirect auf Onboarding) – auch ok"
 reset_state
@@ -873,7 +887,8 @@ assert_docker 1 "pull"
 assert_fcontains "$ENV_PATH" "BETTER_AUTH_SECRET=deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 assert_fcontains "$ENV_PATH" "DEPLOYMENT_ID=11111111-2222-3333-4444-555555555555"
 assert_fcontains "$ENV_PATH" "SCRAPE_TARGETS=chatgpt:cloro:online,google-ai-mode:cloro:online"
-assert_fregex "$ENV_PATH" '^APP_URL=http://127.0.0.1:1515$'
+assert_fregex "$ENV_PATH" '^APP_URL=http://'"$CT_IP"':1515$'
+assert_fregex "$ENV_PATH" '^BETTER_AUTH_URL=http://127.0.0.1:1515$'
 assert_out "Update abgeschlossen – Daten (Postgres-Volume) blieben erhalten."
 
 t "--update auf gestopptem CT → startet ihn selbst (Grube 10)"
@@ -949,7 +964,7 @@ ec=$(run_installer --status); assert_exit 0 "$ec"
 assert_out "Container:  200 (running) – elmo"
 assert_out "Service:   elmo läuft (systemctl is-active)"
 assert_out "Stack:     postgres running web running worker running"
-assert_out "APP_URL:   http://127.0.0.1:1515"
+assert_out "APP_URL:   http://10.120.5.42:1515"
 assert_out "Scrape:    chatgpt:cloro:online,google-ai-mode:cloro:online"
 assert_out "LLM-Key:   NICHT gesetzt"
 assert_out "Missing environment configuration"

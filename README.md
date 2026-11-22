@@ -92,17 +92,24 @@ Worker den Start und crash-looped). Echte Targets:
     --scrape-targets "chatgpt:openrouter:openai/gpt-5-mini:online,google-ai-mode:openrouter:openai/gpt-5-mini:online"
 ```
 
-## Web-UI & APP_URL (Loopback-Pin)
+## Web-UI, Login & APP_URL (Zwei-URL-Aufteilung)
 
-`APP_URL` wird vom Installer auf `http://127.0.0.1:<PORT>` **gepinnt** (nicht
-die CT-IP) – Grund: elmo-web startet sonst nicht (die MCP-Auth verlangt für
-ihre Resource-ID zwingend `https://` **oder** `localhost`/`127.x`; im Container
-ist `NODE_ENV=production`, „localhost“ greift also nicht). Die Web-UI ist
-trotzdem von außen erreichbar (Browser lädt nur HTML+Assets, relative Pfade
-bleiben relativ). Für den **MCP-Server** (`/api/mcp`) oder saubere Links
-`APP_URL=https://deine-domain.example` in `/opt/elmo/.env` setzen
-(Reverse-Proxy/TLS) – der Loopback-Pin erkennt `https://` und greift dann nicht
-mehr.
+Elmo hat zwei gegenläufige URL-Zwänge, die der Installer automatisch auflöst:
+
+1. **MCP-Auth** (`packages/lib/src/auth/server.ts:mcpResource`) verlangt für ihre
+   Resource-ID zwingend `https://` **oder** `localhost`/`127.x` – im Container ist
+   `NODE_ENV=production`, „localhost“ greift also nicht. Die Auth-`baseURL`
+   (`APP_URL || BETTER_AUTH_URL`) muss loopback-akzeptiert sein, sonst Boot-500.
+2. **Better Auth** prüft beim Login/Registrieren die Browser-Origin gegen
+   `APP_URL` (trustedOrigins) – ist `APP_URL` ein Loopback, scheitert **jeder**
+   Login/Registrierung vom LAN mit **„Invalid origin“** (Live-Grube 2026-11-22).
+
+Lösung: **`APP_URL` = echte Origin** (`http://<CT-IP>:<PORT>`) und
+**`BETTER_AUTH_URL` = Loopback** (`http://127.0.0.1:<PORT>`) – erfüllt beides
+(web bootet, Login vom LAN klappt; Email/Login-Redirects sind relativ). Für den
+**MCP-Server** oder saubere Links `APP_URL=https://deine-domain.example` in
+`/opt/elmo/.env` setzen (Reverse-Proxy/TLS) – der IP-Sync erkennt `https://` und
+greift dann nicht mehr.
 
 ## Update
 
@@ -132,7 +139,7 @@ Exit-Code, Log-Auszüge, Container-Logs) und bleibt zur Inspektion stehen
 ```
 ┌─ LXC „elmo“ (unprivileged, Docker-in-LXC) ─────────────────┐
 │  systemd: elmo.service (Restart=always, ExecStartPre       │
-│            sync-app-url.sh → APP_URL = 127.0.0.1-Pin)      │
+│            sync-app-url.sh → APP_URL = CT-IP, AUTH = Loopback) │
 │                                                            │
 │  docker compose (name: elmo):                              │
 │   postgres   postgres:18-alpine      intern (KEIN Expose)  │

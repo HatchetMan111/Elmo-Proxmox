@@ -37,7 +37,7 @@
 set -Eeuo pipefail
 
 # ── Defaults ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="1.0.3"   # wird in --status/-Logs ausgegeben – hilft bei Fehlersuche
+INSTALLER_VERSION="1.0.4"   # wird in --status/-Logs ausgegeben – hilft bei Fehlersuche
 APP_NAME="elmo"
 UPSTREAM_OWNER="elmohq"
 UPSTREAM_REPO="elmo"
@@ -613,10 +613,18 @@ fi
 [[ -n "$(dotenv_get VITE_APP_NAME)" ]]   || dotenv_set VITE_APP_NAME "Elmo"
 [[ -n "$(dotenv_get VITE_APP_ICON)" ]]   || dotenv_set VITE_APP_ICON "/icons/elmo-icon.svg"
 [[ -n "$(dotenv_get DATABASE_URL)" ]]    || dotenv_set DATABASE_URL "postgres://postgres:postgres@postgres:5432/elmo"
-# APP_URL wird unten (sync-app-url.sh) auf http://127.0.0.1:<PORT> gepinnt –
-# das ist der Loopback, den die MCP-Auth akzeptiert (siehe sync-app-url.sh).
-# Nur der ERSTE Eintrag kommt hier als Fallback rein:
+# WICHTIG – die Zwei-URL-Aufteilung (Live-Grube "Invalid origin" 2026-11-22):
+#  • APP_URL = die ECHTE Origin (http://<CT-IP>:<PORT>) – Better Auth prüft
+#    dagegen die Browser-Origin beim Login/Registrieren. Mit Loopback hier
+#    scheitert jeder Login vom LAN ("Invalid origin")!
+#  • BETTER_AUTH_URL = Loopback (http://127.0.0.1:<PORT>) – die MCP-Auth liest
+#    die baseURL (APP_URL || BETTER_AUTH_URL) und akzeptiert für die MCP-
+#    Resource-ID NUR https/localhost/127.x → ohne diesen Pin Boot-500.
+#  Beide zusammen: web bootet (MCP ok) UND Login/Registrierung vom LAN ok.
+#  sync-app-url.sh hält beide synchron (nur http, kein https → Domain-Modus
+#  mit echter https-APP_URL lässt alles unverändert).
 [[ -n "$(dotenv_get APP_URL)" ]]         || dotenv_set APP_URL "http://127.0.0.1:${UI_PORT}"
+[[ -n "$(dotenv_get BETTER_AUTH_URL)" ]] || dotenv_set BETTER_AUTH_URL "http://127.0.0.1:${UI_PORT}"
 [[ -n "$(dotenv_get VITE_APP_URL)" ]]    || dotenv_set VITE_APP_URL "http://127.0.0.1:${UI_PORT}"
 # Telemetrie: AUS ist Default (--telemetry erlaubt sie). Leerer Wert = erlaubt,
 # "1" = aus (die CLI prüft Boolean(process.env.DISABLE_TELEMETRY) – "0" wäre
@@ -644,20 +652,26 @@ chmod 600 .env
 echo ">>> Compose-Konfiguration validieren ..."
 docker compose config -q || die "docker compose config meldet Fehler (Compose-Datei/.env prüfen).\n  Debug: cd $APP_DIR && docker compose config"
 
-echo ">>> APP-URL-Sync-Script schreiben (Loopback-Pinning, kein IP-Sync) ..."
-# Live-Grube 2026-11-22: elmo-web BOOTET NICHT mit einer plain-http-IP als
-# APP_URL – die MCP-Auth (better-auth) verlangt für die Resource-ID zwingend
-# https:// ODER localhost/127.x ( packages/lib/src/auth/server.ts:mcpResource ).
-# NODE_ENV=production ist im Image fix, "localhost" greift also nicht als
-# localOrigin. Lösung: APP_URL auf http://127.0.0.1:<PORT> pinnen – das ist
-# loopback-akzeptiert, web bootet, und die UI ist trotzdem von außen erreichbar
-# (Browser lädt nur HTML+Assets; relative Pfade bleiben relativ). Wer den
-# MCP-Server braucht, setzt in .env eine https://-Domain – dann greift der
-# Domain-Modus hier nicht mehr (Sync bleibt unverändert).
+echo ">>> APP-URL-Sync-Script schreiben (APP_URL = echte IP, BETTER_AUTH_URL = Loopback) ..."
+# Live-Gruben 2026-11-22 (zwei gegenläufige Zwänge):
+#  1. MCP-Auth (packages/lib/src/auth/server.ts:mcpResource) verlangt für die
+#     MCP-Resource-ID zwingend https:// ODER localhost/127.x – NODE_ENV=production
+#     ist im Image fix, "localhost" greift also nicht als localOrigin. Die
+#     baseURL (APP_URL || BETTER_AUTH_URL) muss deshalb loopback-akzeptiert sein,
+#     sonst Boot-500.
+#  2. Better Auth prüft beim Login/Registrieren die Browser-Origin gegen
+#     APP_URL (trustedOrigins) – ist APP_URL ein Loopback, scheitert JEDER Login
+#     vom LAN mit "Invalid origin".
+# Lösung: APP_URL = echte Origin (http://<CT-IP>:<PORT>), BETTER_AUTH_URL =
+# Loopback (http://127.0.0.1:<PORT>). Die Zwei-URL-Aufteilung erfüllt beide:
+# web bootet (MCP sieht Loopback) UND Login/Registrierung vom LAN klappen
+# (Better Auth vertraut der echten Origin). Email/Login-Redirects sind relativ
+# (safeReturnTo) – kein Problem. Wer MCP braucht, setzt eine https://-APP_URL
+# (Domain-Modus: dann greift weder IP- noch Loopback-Sync).
 cat > "${APP_DIR}/sync-app-url.sh" <<SYNCEOF
 #!/usr/bin/env bash
-# Pinnt APP_URL/VITE_APP_URL auf den Loopback-Port (http://127.0.0.1:<PORT>),
-# damit elmo-web überhaupt startet (MCP braucht https ODER loopback).
+# Hält APP_URL (echte CT-IP-Origin, für Better-Auth trustedOrigins) und
+# BETTER_AUTH_URL (Loopback, für die MCP-Resource-ID) synchron.
 # Domain-Modus: beginnt APP_URL mit https://, greift NICHTS (Sync macht nichts).
 set -euo pipefail
 SELF_DIR=\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)
@@ -671,16 +685,20 @@ set_key() { # KEY VALUE – ersetzen oder anhängen (idempotent)
 }
 CURRENT=\$(sed -n 's/^APP_URL=//p' .env 2>/dev/null | head -1 || true)
 case "\$CURRENT" in
-    https://*) echo "elmo-sync: Domain-Modus (APP_URL=\$CURRENT) – kein Pinning"; exit 0 ;;
+    https://*) echo "elmo-sync: Domain-Modus (APP_URL=\$CURRENT) – kein Sync"; exit 0 ;;
 esac
-WANT="http://127.0.0.1:${UI_PORT}"
-if [[ "\$CURRENT" != "\$WANT" ]]; then
-    echo "elmo-sync: APP_URL=\${CURRENT:-unbekannt} → \$WANT (Loopback-Pin)"
+IP=\$(ip -4 addr show eth0 scope global 2>/dev/null | awk '/inet /{print \$2; exit}' | cut -d/ -f1 || true)
+[[ -n "\$IP" ]] || { echo "elmo-sync: keine globale IPv4 an eth0 – .env bleibt unverändert"; exit 0; }
+WANT_APP="http://\${IP}:${UI_PORT}"
+WANT_AUTH="http://127.0.0.1:${UI_PORT}"
+if [[ "\$CURRENT" != "\$WANT_APP" ]]; then
+    echo "elmo-sync: APP_URL=\${CURRENT:-unbekannt} → \$WANT_APP (echte IP-Origin)"
 else
-    echo "elmo-sync: APP_URL unverändert (\$WANT)"
+    echo "elmo-sync: APP_URL unverändert (\$WANT_APP)"
 fi
-set_key APP_URL "\$WANT"
-set_key VITE_APP_URL "\$WANT"
+set_key APP_URL "\$WANT_APP"
+set_key VITE_APP_URL "\$WANT_APP"
+set_key BETTER_AUTH_URL "\$WANT_AUTH"
 SYNCEOF
 chmod +x "${APP_DIR}/sync-app-url.sh"
 
