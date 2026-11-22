@@ -732,6 +732,24 @@ ec=$(run_installer --openrouter-key "sk-or-v1-test123"); assert_exit 0 "$ec"
 assert_fcontains "$ENV_PATH" "OPENROUTER_API_KEY=sk-or-v1-test123"
 assert_out "OPENROUTER_API_KEY gesetzt (per --openrouter-key)"
 
+t "Install mit --onboarding-key (Schnellweg: Key + Auto-Target)"
+reset_state
+ec=$(run_installer --onboarding-key "sk-or-v1-onb"); assert_exit 0 "$ec"
+assert_fcontains "$ENV_PATH" "OPENROUTER_API_KEY=sk-or-v1-onb"
+assert_fcontains "$ENV_PATH" "SCRAPE_TARGETS=chatgpt:openrouter:openai/gpt-5-mini:online"
+assert_out "OPENROUTER_API_KEY gesetzt (per --openrouter-key)"
+
+t "--onboarding-key + --openrouter-key (unterschiedlich) → die()"
+reset_state
+ec=$(run_installer --onboarding-key "sk-or-v1-a" --openrouter-key "sk-or-v1-b"); assert_exit 1 "$ec"
+assert_out "bitte nur einen verwenden"
+
+t "Install mit --onboarding-key + --scrape-targets (Targets bleiben)"
+reset_state
+ec=$(run_installer --onboarding-key "sk-or-v1-onb" --scrape-targets "chatgpt:cloro:online"); assert_exit 0 "$ec"
+assert_fcontains "$ENV_PATH" "SCRAPE_TARGETS=chatgpt:cloro:online"
+assert_fcontains "$ENV_PATH" "OPENROUTER_API_KEY=sk-or-v1-onb"
+
 t "Install mit --scrape-targets (Custom)"
 reset_state
 ec=$(run_installer --scrape-targets "chatgpt:cloro:online,google-ai-mode:cloro:online"); assert_exit 0 "$ec"
@@ -933,8 +951,17 @@ assert_out "Service:   elmo läuft (systemctl is-active)"
 assert_out "Stack:     postgres running web running worker running"
 assert_out "APP_URL:   http://127.0.0.1:1515"
 assert_out "Scrape:    chatgpt:cloro:online,google-ai-mode:cloro:online"
-assert_out "OpenRouter-Key: NICHT gesetzt"
+assert_out "LLM-Key:   NICHT gesetzt"
+assert_out "Missing environment configuration"
+assert_out "Scraper:   KEINER gesetzt"
 assert_out "Web-UI:    http://10.120.5.42:1515  (HTTP 200)"
+
+t "--status: OpenRouter-Key gesetzt → LLM-Key ok (kein Wert im Log!)"
+seed_ct
+/bin/grep -q '^OPENROUTER_API_KEY=' "$ENV_PATH" || echo "OPENROUTER_API_KEY=sk-or-secret-abc123" >> "$ENV_PATH"
+ec=$(run_installer --status); assert_exit 0 "$ec"
+assert_out "LLM-Key:   gesetzt (OPENROUTER_API_KEY)"
+assert_no_out "sk-or-secret-abc123"
 
 t "--status: Host_curl_fail → Warnung mit HTTP 000"
 seed_ct

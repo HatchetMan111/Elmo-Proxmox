@@ -37,7 +37,7 @@
 set -Eeuo pipefail
 
 # ── Defaults ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="1.0.2"   # wird in --status/-Logs ausgegeben – hilft bei Fehlersuche
+INSTALLER_VERSION="1.0.3"   # wird in --status/-Logs ausgegeben – hilft bei Fehlersuche
 APP_NAME="elmo"
 UPSTREAM_OWNER="elmohq"
 UPSTREAM_REPO="elmo"
@@ -70,12 +70,14 @@ SCRAPE_TARGETS_DEFAULT="stub:main:stub:online"
                             # Echte Targets: --scrape-targets + --openrouter-key o. Keys
 SCRAPE_TARGETS=""           # leer = Default oben (Flag --scrape-targets überschreibt)
 OPENROUTER_API_KEY=""       # optional per Flag; Nachrüstung jederzeit in .env
+ONBOARDING_KEY=""           # --onboarding-key: Alias für --openrouter-key + Auto-Target
 TELEMETRY=false             # DISABLE_TELEMETRY=1 (Elmo sammelt sonst anonyme Telemetrie)
 UNINSTALL=false
 UPDATE=false
 STATUS_CHECK=false
 FORCE_RECREATE=false
 ASSUME_YES=false
+ONBOARDING=false           # --onboarding-key gesetzt (Schnellweg für Setup)
 TMP_DIR=""
 LOG_FILE="/tmp/${APP_NAME}-installer-$(date +%Y%m%d-%H%M%S).log"
 # Der fertige Einzeiler für Hinweise/Fehlerausgaben – exakt kopierbar (Optionen
@@ -336,6 +338,7 @@ parse_args() {
             --version)         ELMO_VERSION="${args[$((i+1))]:-}"; i=$((i+2)) ;;
             --scrape-targets)  SCRAPE_TARGETS="${args[$((i+1))]:-}"; i=$((i+2)) ;;
             --openrouter-key)  OPENROUTER_API_KEY="${args[$((i+1))]:-}"; i=$((i+2)) ;;
+            --onboarding-key)  ONBOARDING_KEY="${args[$((i+1))]:-}"; i=$((i+2)) ;;
             --telemetry)       TELEMETRY=true; i=$((i+1)) ;;
             --force)           FORCE_RECREATE=true; i=$((i+1)) ;;
             --yes|-y)          ASSUME_YES=true; i=$((i+1)) ;;
@@ -356,6 +359,20 @@ parse_args() {
     fi
     if [[ -n "$SCRAPE_TARGETS" && "$SCRAPE_TARGETS" != *:* ]]; then
         die "Ungültiges SCRAPE_TARGETS-Format: '$SCRAPE_TARGETS'\n  Format: modell:provider[:version][:online], z. B. chatgpt:openrouter:openai/gpt-5-mini:online"
+    fi
+    # --onboarding-key ist der userfreundliche Schnellweg: setzt den OpenRouter-
+    # Key und – wenn kein explizites --scrape-targets kam – automatisch ein
+    # passendes Echt-Target (chatgpt via OpenRouter). "--onboarding-key" und
+    # "--openrouter-key" schließen sich gegenseitig aus (gleicher Key).
+    if [[ -n "$ONBOARDING_KEY" ]]; then
+        if [[ -n "$OPENROUTER_API_KEY" && "$OPENROUTER_API_KEY" != "$ONBOARDING_KEY" ]]; then
+            die "--onboarding-key und --openrouter-key sind beide gesetzt, aber unterschiedlich – bitte nur einen verwenden."
+        fi
+        OPENROUTER_API_KEY="$ONBOARDING_KEY"
+        if [[ -z "$SCRAPE_TARGETS" ]]; then
+            SCRAPE_TARGETS="chatgpt:openrouter:openai/gpt-5-mini:online"
+        fi
+        ONBOARDING=true
     fi
 }
 
@@ -384,8 +401,11 @@ Optionen (hinter dem schließenden Anführungszeichen anhängen, z. B. ... " --i
   --version V        elmo-Image-Pin überschreiben (Default: 0.7.12)
   --scrape-targets S SCRAPE_TARGETS setzen (Format: modell:provider[:version][:online],
                      z. B. "chatgpt:openrouter:openai/gpt-5-mini:online,perplexity:perplexity-api")
-                     Default: chatgpt:openrouter:openai/gpt-5-mini:online
+                     Default: stub:main (keyless – Worker bootet ohne Keys)
   --openrouter-key K OpenRouter-API-Key direkt in die .env schreiben (optional)
+  --onboarding-key K Alias für --openrouter-key + schaltet SCRAPE_TARGETS
+                     automatisch auf ein passendes Echt-Target um (kein Setup-
+                     Rätsel) – der schnellste Weg zu einem Setup ohne Meldungen
   --telemetry        Anonyme Telemetrie an elmo erlauben (Default: AUS)
   --force            Vorhandenen Container mit gleichem Hostname löschen und neu anlegen
   --yes / -y         Rückfragen überspringen
@@ -755,6 +775,8 @@ run_inner_setup() {
     # APPLY_SCRAPE/APPLY_OPENROUTER: bei Installation immer anwenden; SCRAPE-
     # TARGETS-Default wird bei Update NICHT über bestehende .env-Werte gestampft
     # (Nutzer-Konfiguration bleibt erhalten) – nur explizite Flags überschreiben.
+    # --onboarding-key setzt automatisch mit (Schnellweg für ein Setup ohne
+    # "Missing environment configuration"-Meldung).
     local scrape_in="$SCRAPE_TARGETS"
     [[ -n "$scrape_in" ]] || scrape_in="$SCRAPE_TARGETS_DEFAULT"
     local apply_scrape=1
@@ -770,7 +792,7 @@ run_inner_setup() {
         UI_PORT="$UI_PORT" HOST_DNS="${HOST_DNS:-1.1.1.1}" \
         TELEMETRY="$TELEMETRY" SCRAPE_TARGETS_IN="$scrape_in" \
         OPENROUTER_KEY_IN="$OPENROUTER_API_KEY" APPLY_SCRAPE="$apply_scrape" \
-        APPLY_OPENROUTER="$apply_openrouter" \
+        APPLY_OPENROUTER="$apply_openrouter" ONBOARDING="$ONBOARDING" \
         bash -c 'set -o pipefail; bash /root/setup-inner.sh 2>&1 | tee /var/log/elmo-setup.log'
 }
 
@@ -866,18 +888,18 @@ print_summary() {
     echo -e "  ${CYAN}Erste Schritte:${NC}"
     echo "  1. http://${ct_ip}:${UI_PORT} öffnen und im Onboarding die erste"
     echo "     Marke (+ Wettbewerber) anlegen"
-    echo "  2. Provider-Keys hinterlegen (ohne Keys läuft der Worker im"
-    echo "     Stub-Modus: 'no network', antwortet nur mit dem Prompt selbst!):"
-    echo "     - OpenRouter (Judge-Modell + Onboarding + Opportunities):"
-    echo "         pct exec ${CT_ID} -- sed -i 's|^OPENROUTER_API_KEY=.*|OPENROUTER_API_KEY=sk-or-...|' ${APP_DIR}/.env"
-    echo "       oder beim Installer:  ${ONE_LINER} --update --openrouter-key sk-or-..."
-    echo "     - Scraper (liefert die echten ChatGPT-/Gemini-/Google-AI-Antworten),"
-    echo "       z. B. Cloro, BrightData, SearchApi, Olostep, Oxylabs – Key in"
-    echo "       ${APP_DIR}/.env ergänzen (KEY-Namen im README), dann:"
-    echo "         ${ONE_LINER} --update"
-    echo "  3. SCRAPE_TARGETS anpassen (welche Engines getrackt werden) –"
-    echo "     aktuell Default 'stub:main' (keyless). Beispiel mit echtem Target:"
-    echo "         ${ONE_LINER} --update --openrouter-key sk-or-... --scrape-targets \"chatgpt:openrouter:openai/gpt-5-mini:online\""
+    echo ""
+    echo -e "  ${CYAN}Setup vervollständigen (empfohlen, damit Onboarding & Report$NC"
+    echo -e "  ${CYAN}funktionieren und keine 'Missing environment configuration'-$NC"
+    echo -e "  ${CYAN}Meldung erscheint):${NC}"
+    echo "     LLM-Key (Onboarding + Opportunities – EINER reicht):"
+    echo "       ${ONE_LINER} --update --onboarding-key sk-or-v1-...     # OpenRouter"
+    echo "     Scraper (echte ChatGPT-/Gemini-/Google-AI-Antworten – ohne Keys"
+    echo "     läuft der Worker im Stub-Modus, 'no network'):"
+    echo "       Key in ${APP_DIR}/.env ergänzen (z. B. CLORO_API_KEY=...), dann:"
+    echo "       ${ONE_LINER} --update"
+    echo "     Volle Kontrolle (Key + Targets getrennt):"
+    echo "       ${ONE_LINER} --update --openrouter-key sk-or-... --scrape-targets \"chatgpt:openrouter:openai/gpt-5-mini:online\""
     echo "     (WICHTIG: jeder Provider in SCRAPE_TARGETS braucht seinen Key,"
     echo "      sonst bootet der Worker nicht – siehe README.)"
     echo ""
@@ -1116,21 +1138,47 @@ do_status() {
         warn "Stack:     docker compose ps lieferte nichts (Stack noch nie gestartet?)"
     fi
 
-    # Konfiguration (ohne Secrets auszugeben)
-    local app_url scrape ork=""
+    # Konfiguration (ohne Secrets auszugeben – nur KEY-Status, nie Werte)
+    local app_url scrape
     app_url=$(pct exec "$ct_id" -- sed -n 's/^APP_URL=//p' "${APP_DIR}/.env" 2>/dev/null | head -1 || true)
     scrape=$(pct exec "$ct_id" -- sed -n 's/^SCRAPE_TARGETS=//p' "${APP_DIR}/.env" 2>/dev/null | head -1 || true)
-    ork=$(pct exec "$ct_id" -- sed -n 's/^OPENROUTER_API_KEY=//p' "${APP_DIR}/.env" 2>/dev/null | head -1 || true)
     if [[ -n "$app_url" ]]; then
         info "APP_URL:   $app_url"
     fi
     if [[ -n "$scrape" ]]; then
         info "Scrape:    $scrape"
     fi
-    if [[ -n "$ork" ]]; then
-        ok "OpenRouter-Key: gesetzt (Länge ${#ork})"
+
+    # ── Provider-Key-Status (LLM fürs Onboarding + Scraper fürs Tracking) ──
+    # Onboarding/Opportunities brauchen EINEN LLM-Key (OpenRouter | OpenAI |
+    # Anthropic | Mistral). Scraper-Keys (Cloro/BrightData/...) liefern die
+    # echten Engine-Antworten. Werte werden NIE ausgegeben, nur gesetzt/nicht.
+    local -a llm_keys=(OPENROUTER_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY MISTRAL_API_KEY)
+    local -a scraper_keys=(CLORO_API_KEY BRIGHTDATA_API_TOKEN SEARCHAPI_API_KEY OLOSTEP_API_KEY OXYLABS_USERNAME DATAFORSEO_LOGIN)
+    local -a llm_set=() llm_missing=() scraper_set=() llm_any=false
+    local k v
+    for k in "${llm_keys[@]}"; do
+        v=$(pct exec "$ct_id" -- sed -n "s/^${k}=//p" "${APP_DIR}/.env" 2>/dev/null | head -1 || true)
+        if [[ -n "$v" ]]; then llm_set+=("$k"); llm_any=true; else llm_missing+=("$k"); fi
+    done
+    for k in "${scraper_keys[@]}"; do
+        v=$(pct exec "$ct_id" -- sed -n "s/^${k}=//p" "${APP_DIR}/.env" 2>/dev/null | head -1 || true)
+        [[ -n "$v" ]] && scraper_set+=("$k")
+    done
+    if $llm_any; then
+        ok "LLM-Key:   gesetzt (${llm_set[*]}) – Onboarding/Opportunities können laufen"
     else
-        warn "OpenRouter-Key: NICHT gesetzt – Judge/Onboarding/Opportunities ohne Key ohne Funktion."
+        warn "LLM-Key:   NICHT gesetzt – die UI zeigt 'Missing environment configuration'!"
+        warn "           Onboarding/Opportunities brauchen EINEN Key:"
+        warn "             ${ONE_LINER} --update --onboarding-key sk-or-v1-..."
+        warn "           (oder OPENAI_API_KEY/ANTHROPIC_API_KEY/MISTRAL_API_KEY in ${APP_DIR}/.env)"
+    fi
+    if [[ ${#scraper_set[@]} -gt 0 ]]; then
+        ok "Scraper:   gesetzt (${scraper_set[*]}) – echte Engine-Antworten möglich"
+    else
+        warn "Scraper:   KEINER gesetzt – Worker läuft im Stub-Modus (keine echten"
+        warn "           ChatGPT-/Gemini-/Google-AI-Antworten). Keys: CLORO_API_KEY,"
+        warn "           BRIGHTDATA_API_TOKEN, SEARCHAPI_API_KEY, OLOSTEP_API_KEY, ..."
     fi
 
     local ip code=""

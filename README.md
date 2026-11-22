@@ -38,10 +38,17 @@ Am Ende bekommst du die URL: `http://<LXC-IP>:1515` (1515 = Default der offiziel
 ... " --id 210 --memory 4096 --port 1515
 ... " --ip 192.168.1.50/24 --gateway 192.168.1.1     # statische IP
 ... " --scrape-targets "chatgpt:openrouter:openai/gpt-5-mini:online,google-ai-mode:openrouter:openai/gpt-5-mini:online"
-... " --openrouter-key sk-or-v1-...
+... " --onboarding-key sk-or-v1-...                   # LLM-Key + Auto-Target (Schnellweg, empfohlen)
+... " --openrouter-key sk-or-v1-...                   # nur den OpenRouter-Key setzen
 ... " --version 0.7.12                                # Image-Pin überschreiben
 ... " --force                                         # bestehenden CT neu aufsetzen
 ```
+
+**Schnellster Weg zu einem Setup ohne „Missing environment configuration“-Meldung:**
+`--onboarding-key <OpenRouter-Key>` — setzt den LLM-Key (Onboarding + Opportunities)
+und schaltet `SCRAPE_TARGETS` automatisch auf ein passendes Echt-Target
+(`chatgpt:openrouter:openai/gpt-5-mini:online`) um. Volle Kontrolle über beides
+getrennt: `--openrouter-key` + `--scrape-targets`.
 
 ## ⚠️ Provider-Keys (wichtig)
 
@@ -54,18 +61,23 @@ Elmo fragt **echte AI-Engines** ab – dafür braucht es eigene Accounts/Keys (B
 | Alternative: direkte Modell-APIs | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `MISTRAL_API_KEY`, `PERPLEXITY_API_KEY` | je nach `SCRAPE_TARGETS` |
 
 Der Stack läuft auch **ohne Keys** hoch – die Web-UI ist erreichbar, aber es laufen
-keine Abfragen, bis Keys gesetzt sind. Nachrüsten:
+keine Abfragen, bis Keys gesetzt sind (die UI zeigt dann „Missing environment
+configuration“). Nachrüsten — am einfachsten mit dem Setup-Schnellweg:
 
 ```bash
-# Key direkt setzen (exakter Befehl):
-pct exec <CT-ID> -- sed -i 's|^OPENROUTER_API_KEY=.*|OPENROUTER_API_KEY=sk-or-v1-...|' /opt/elmo/.env
+# LLM-Key + Auto-Target in einem Rutsch (empfohlen):
+bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/Elmo-Proxmox/main/install/elmo.sh)" --update --onboarding-key sk-or-v1-...
 
-# oder über den Installer:
-bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/Elmo-Proxmox/main/install/elmo.sh)" --update --openrouter-key sk-or-v1-...
+# oder Key + Targets getrennt steuern:
+... " --update --openrouter-key sk-or-v1-...
+... " --update --scrape-targets "chatgpt:openrouter:openai/gpt-5-mini:online"
 
-# danach Stack neu durchziehen:
+# danach Stack neu durchziehen (erkennt Änderungen automatisch):
 ... " --update
 ```
+
+`--status` zeigt jederzeit, welche Keys gesetzt sind (nur Namen, **nie** Werte) –
+inkl. „LLM-Key“ (Onboarding/Opportunities) und „Scraper“ (echte Engine-Antworten).
 
 `SCRAPE_TARGETS` bestimmt, welche Engines getrackt werden (Format
 `modell:provider[:version][:online]`, kommasepariert). Default: **`stub:main`**
