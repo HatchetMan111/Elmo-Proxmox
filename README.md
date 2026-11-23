@@ -12,10 +12,15 @@ Wettbewerber-Benchmark und priorisierten Optimierungs-Empfehlungen. Mit eingebau
 ## Installation (Einzeiler, auf dem Proxmox-Host als root)
 
 ```bash
-bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/Elmo-Proxmox/main/install/elmo.sh)"
+bash -c "$(wget --no-cache --no-cookies --header="Cache-Control: no-cache" -qLO - https://raw.githubusercontent.com/HatchetMan111/Elmo-Proxmox/main/install/elmo.sh)"
 ```
 
 Das Script:
+
+> ⚠️ **`--no-cache --no-cookies`** im Einzeiler ist Absicht — ein schlichter
+> `wget -qLO -` kann einen STALE-Cache-Treffer landen (Live-Grube 2026-11-23:
+> ein alter Installer lief und neuere Fixes fehlten). Die `INSTALLER_VERSION`
+> am Anfang der Ausgabe zeigt immer, welchen Stand man wirklich erwischt hat.
 
 - erstellt einen **unprivilegierten LXC** (Default: 2 vCPU, 4 GB RAM, 12 GB Disk,
   Debian 13 bevorzugt, `nesting=1 keyctl=1`, `onboot=1`, Hostname `elmo`, nächste
@@ -66,7 +71,7 @@ configuration“). Nachrüsten — am einfachsten mit dem Setup-Schnellweg:
 
 ```bash
 # LLM-Key + Auto-Target in einem Rutsch (empfohlen):
-bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/Elmo-Proxmox/main/install/elmo.sh)" --update --onboarding-key sk-or-v1-...
+bash -c "$(wget --no-cache --no-cookies --header="Cache-Control: no-cache" -qLO - https://raw.githubusercontent.com/HatchetMan111/Elmo-Proxmox/main/install/elmo.sh)" --update --onboarding-key sk-or-v1-...
 
 # oder Key + Targets getrennt steuern:
 ... " --update --openrouter-key sk-or-v1-...
@@ -114,7 +119,7 @@ greift dann nicht mehr.
 ## Update
 
 ```bash
-bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/Elmo-Proxmox/main/install/elmo.sh)" --update
+bash -c "$(wget --no-cache --no-cookies --header="Cache-Control: no-cache" -qLO - https://raw.githubusercontent.com/HatchetMan111/Elmo-Proxmox/main/install/elmo.sh)" --update
 ```
 
 - zieht die im Installer gepinnte Image-Version (der Pin im Repo wird bei Releases aktualisiert)

@@ -24,7 +24,10 @@
 #  nachrüsten (+ --update). Details im README und in der Summary am Ende.
 #
 #  Installation (auf dem Proxmox-Host als root):
-#    bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/Elmo-Proxmox/main/install/elmo.sh)"
+#    bash -c "$(wget --no-cache --no-cookies --header="Cache-Control: no-cache" -qLO - https://raw.githubusercontent.com/HatchetMan111/Elmo-Proxmox/main/install/elmo.sh)"
+#  (Das --no-cache --no-cookies beugt einem STALE wget-Cache vor – Live-Grube
+#   2026-11-23: ein alter Installer lief und die Fixes fehlten. INSTALLER_VERSION
+#   am Anfang der Ausgabe zeigt, welchen Stand man wirklich erwischt hat.)
 #
 #  Mit Optionen (direkt hinter dem schließenden Anführungszeichen):
 #    ... " --id 210 --memory 4096 --port 1515 --openrouter-key sk-or-...
@@ -37,7 +40,7 @@
 set -Eeuo pipefail
 
 # ── Defaults ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="1.0.4"   # wird in --status/-Logs ausgegeben – hilft bei Fehlersuche
+INSTALLER_VERSION="1.0.5"   # wird in --status/-Logs ausgegeben – hilft bei Fehlersuche
 APP_NAME="elmo"
 UPSTREAM_OWNER="elmohq"
 UPSTREAM_REPO="elmo"
@@ -62,11 +65,15 @@ CT_PASSWORD=""              # leer = automatisch generieren
 CT_SSHKEY=""                # Pfad ODER URL zu einer Public-Key-Datei (optional)
 SSH_KEY_FILE=""             # aufgelöste Key-Datei für pct create
 UI_PORT=1515                # Web-UI-Host-Port (Default der offiziellen elmo-CLI)
-SCRAPE_TARGETS_DEFAULT="stub:main:stub:online"
+SCRAPE_TARGETS_DEFAULT="stub:stub:online"
                             # Default = der KEYLESS-"stub"-Provider ("no network",
                             # antwortet mit dem Prompt selbst) – der Worker bootet
-                            # damit OHNE API-Keys garantiert (Live-Grube 2026-11-22:
-                            # "provider openrouter requires API key(s)" → Crash-Loop).
+                            # damit OHNE API-Keys garantiert (Live-Gruben: "provider
+                            # openrouter requires API key(s)" → Crash-Loop).
+                            # Format ist model:provider[:version][:online] – Segment 2
+                            # ist der PROVIDER! "stub:main" war ein Bug (main landete
+                            # als Provider → "Unknown provider: main", Live 2026-11-23).
+                            # Modell 'stub' + Provider 'stub' + :online = gültig.
                             # Echte Targets: --scrape-targets + --openrouter-key o. Keys
 SCRAPE_TARGETS=""           # leer = Default oben (Flag --scrape-targets überschreibt)
 OPENROUTER_API_KEY=""       # optional per Flag; Nachrüstung jederzeit in .env
@@ -83,7 +90,13 @@ LOG_FILE="/tmp/${APP_NAME}-installer-$(date +%Y%m%d-%H%M%S).log"
 # Der fertige Einzeiler für Hinweise/Fehlerausgaben – exakt kopierbar (Optionen
 # hinter dem schließenden Anführungszeichen; der Installer erkennt sie via $0-Fallback)
 # shellcheck disable=SC2016  # Absicht: Literal, das zum Ausgeben gedacht ist
-ONE_LINER='bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/Elmo-Proxmox/main/install/elmo.sh)"'
+# WICHTIG: `wget -qLO -` ohne Cache-Header kann einen STALE-Cache Treffer landen
+# (Live-Grube 2026-11-23: alter Installer lief → v1.0.4-Fixes fehlten). Deshalb
+# `--no-cache --no-cookies` + `Cache-Control: no-cache`-Header – GitHub Raw
+# liefert zwar korrekt aus, aber der wget-Cache auf dem Host kann trotzdem stale
+# sein. Der Installer druckt am Anfang INSTALLER_VERSION – so sieht man sofort,
+# welchen Stand man erwischt hat.
+ONE_LINER='bash -c "$(wget --no-cache --no-cookies --header="Cache-Control: no-cache" -qLO - https://raw.githubusercontent.com/HatchetMan111/Elmo-Proxmox/main/install/elmo.sh)"'
 
 # ── Farben & Logging ───────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -380,7 +393,7 @@ print_help() {
     cat <<'EOF'
 🔍 Elmo – Proxmox-Installer (AI-Visibility-Tracking / AEO, elmohq/elmo)
 
-Installation:   bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/Elmo-Proxmox/main/install/elmo.sh)"
+Installation:   bash -c "$(wget --no-cache --no-cookies --header="Cache-Control: no-cache" -qLO - https://raw.githubusercontent.com/HatchetMan111/Elmo-Proxmox/main/install/elmo.sh)"
 
 Optionen (hinter dem schließenden Anführungszeichen anhängen, z. B. ... " --id 210):
   --id ID            Container-ID (Default: nächste freie ab 200)
@@ -952,6 +965,19 @@ do_install() {
     fi
     if ! command -v pct >/dev/null 2>&1; then
         die "pct nicht gefunden – das Script muss auf einem Proxmox-VE-Host laufen."
+    fi
+
+    # Selbstdiagnose: STALE-CACHE erkennen (Live-Grube 2026-11-23). Ein alter
+    # Installer (< v1.0.4) hat die Zwei-URL-Logik nicht – das Resultat ist ein
+    # Boot-500 von web mit "access token is bound to http://<IP>:1515/api/mcp"
+    # (statt 127.0.0.1). Dieser Zweig erkennt KEINE BETTER_AUTH_URL-Zeile im
+    # eigenen Skript (alter Stand) und warnt VOR dem Container-Bau.
+    if ! grep -q 'BETTER_AUTH_URL' "${BASH_SOURCE[0]:-$0}" 2>/dev/null; then
+        warn "STALE-CACHE VERDACHT: dieser Installer ist v${INSTALLER_VERSION}, enthält"
+        warn "aber die Zwei-URL-Logik (BETTER_AUTH_URL) NICHT – vermutlich ein alter"
+        warn "wget-Cache. Bitte mit Cache-Headern neu laden:"
+        echo "    ${ONE_LINER}"
+        warn "oder direkt prüfen:  grep BETTER_AUTH_URL <(wget --no-cache -qO- <URL>)"
     fi
 
     # Bereits vorhanden?
