@@ -96,6 +96,7 @@ link_real "$HOSTBIN" bash sh env awk sed grep cut head tail tr od mktemp tee ope
     seq cat mv cp rm mkdir chmod dirname basename sort uniq readlink date printf ls touch \
     stat id hostname
 ln -sf "$MK/mock-curl"  "$HOSTBIN/curl"
+ln -sf "$MK/mock-wget"  "$HOSTBIN/wget"
 ln -sf "$MK/mock-pct"   "$HOSTBIN/pct"
 ln -sf "$MK/mock-pveam" "$HOSTBIN/pveam"
 ln -sf "$MK/mock-uname" "$HOSTBIN/uname"
@@ -326,6 +327,52 @@ esac
 exit 0
 EOF
 
+cat > "$MK/mock-wget" <<'EOF'
+#!/usr/bin/env bash
+# wget-Mock: bedient die Selbstdiagnose-Rohdatei-URL (gleiche Fixture-Logik
+# wie mock-curl). Der Installer ruft wget --no-cache -qO- <URL> auf.
+set -u
+HS="${HARNESS_STATE:?}"
+url=""; outfile=""; quiet=0; nl=0
+prev=""
+for a in "$@"; do
+    case "$a" in
+        http://*|https://*) url="$a" ;;
+        -O) prev="-O" ;;
+    esac
+    if [[ "$prev" == "-O" ]]; then outfile="$a"; prev=""; fi
+    [[ "$a" == "-q" || "$a" == "-qLO" || "$a" == "-qO-" ]] && quiet=1
+done
+echo "wget $*" >> "$HS/calls.log" 2>/dev/null || true
+
+case "$url" in
+    https://raw.githubusercontent.com/HatchetMan111/Elmo-Proxmox/main/install/elmo.sh)
+        # Selbstdiagnose-Fixture (identisch zu mock-curl): aktuelle Rohdatei
+        # MIT Zwei-URL-Logik; mit $HS/remote_without_auth_url ohne (alter Stand).
+        if [[ -f "$HS/remote_without_auth_url" ]]; then
+            cat <<'REMOTESTALE'
+#!/usr/bin/env bash
+INSTALLER_VERSION="0.0.1"
+REMOTESTALE
+        else
+            cat <<'REMOTEFIX'
+#!/usr/bin/env bash
+INSTALLER_VERSION="9.9.9"
+BETTER_AUTH_URL="http://127.0.0.1:1515"
+REMOTEFIX
+        fi
+        exit 0 ;;
+esac
+
+# Generischer Download: bei -O in Datei schreiben, sonst stdout
+if [[ -n "$outfile" ]]; then
+    echo "mock-wget-content" > "$outfile"
+else
+    echo "mock-wget-content"
+fi
+exit 0
+EOF
+
 cat > "$MK/mock-curl" <<'EOF'
 #!/usr/bin/env bash
 # curl-Mock: Health-/HTTP-Checks → 200/302/000; Downloads → Stub-Dateien
@@ -353,6 +400,25 @@ ln -sf "$MKROOT/mock-docker" "$INNERBIN_DIR/docker" 2>/dev/null
 exit 0
 STUB
         chmod +x "$outfile"
+        exit 0 ;;
+    https://raw.githubusercontent.com/HatchetMan111/Elmo-Proxmox/main/install/elmo.sh)
+        # Selbstdiagnose-Fixture: die "aktuelle Rohdatei" mit Zwei-URL-Logik.
+        # Der Installer prüft per grep BETTER_AUTH_URL darauf – ohne Fixture
+        # würde der Mock-Curl "200" liefern (kein valides Skript) und die
+        # Selbstdiagnose fälschlich warnen. Mit $HS/remote_without_auth_url
+        # simuliert der Testfall einen ALTEN Remote-Stand (ohne Zwei-URL-Logik).
+        if [[ -f "$HS/remote_without_auth_url" ]]; then
+            cat <<'REMOTESTALE'
+#!/usr/bin/env bash
+INSTALLER_VERSION="0.0.1"
+REMOTESTALE
+        else
+            cat <<'REMOTEFIX'
+#!/usr/bin/env bash
+INSTALLER_VERSION="9.9.9"
+BETTER_AUTH_URL="http://127.0.0.1:1515"
+REMOTEFIX
+        fi
         exit 0 ;;
 esac
 
@@ -782,6 +848,17 @@ ec=$(run_installer); assert_exit 0 "$ec"
 assert_fregex "$ENV_PATH" '^APP_URL=http://'"$CT_IP"':1515$'
 assert_fregex "$ENV_PATH" '^BETTER_AUTH_URL=http://127.0.0.1:1515$'
 assert_no_fcontains "$ENV_PATH" "APP_URL=http://127.0.0.1"
+
+t "Selbstdiagnose: Remote-Rohdatei ohne BETTER_AUTH_URL → STALE-CACHE-Warnung"
+reset_state
+touch "$HS/remote_without_auth_url"   # mock-curl liefert Fixture ohne BETTER_AUTH_URL
+ec=$(run_installer); assert_exit 0 "$ec"
+assert_out "STALE-CACHE VERDACHT"
+assert_out "Zwei-URL-Logik"           # Hinweis auf die fehlende Zwei-URL-Logik
+# Gegenprobe: mit intakter Remote-Fixture (BETTER_AUTH_URL drin) KEINE Warnung
+reset_state
+ec=$(run_installer); assert_exit 0 "$ec"
+assert_no_out "STALE-CACHE VERDACHT"
 
 t "Install: Web-UI antwortet mit 302 (Redirect auf Onboarding) – auch ok"
 reset_state

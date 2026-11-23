@@ -40,7 +40,7 @@
 set -Eeuo pipefail
 
 # ── Defaults ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="1.0.5"   # wird in --status/-Logs ausgegeben – hilft bei Fehlersuche
+INSTALLER_VERSION="1.0.6"   # wird in --status/-Logs ausgegeben – hilft bei Fehlersuche
 APP_NAME="elmo"
 UPSTREAM_OWNER="elmohq"
 UPSTREAM_REPO="elmo"
@@ -970,15 +970,22 @@ do_install() {
     # Selbstdiagnose: STALE-CACHE erkennen (Live-Grube 2026-11-23). Ein alter
     # Installer (< v1.0.4) hat die Zwei-URL-Logik nicht – das Resultat ist ein
     # Boot-500 von web mit "access token is bound to http://<IP>:1515/api/mcp"
-    # (statt 127.0.0.1). Dieser Zweig erkennt KEINE BETTER_AUTH_URL-Zeile im
-    # eigenen Skript (alter Stand) und warnt VOR dem Container-Bau.
-    if ! grep -q 'BETTER_AUTH_URL' "${BASH_SOURCE[0]:-$0}" 2>/dev/null; then
-        warn "STALE-CACHE VERDACHT: dieser Installer ist v${INSTALLER_VERSION}, enthält"
-        warn "aber die Zwei-URL-Logik (BETTER_AUTH_URL) NICHT – vermutlich ein alter"
-        warn "wget-Cache. Bitte mit Cache-Headern neu laden:"
+    # (statt 127.0.0.1). Statt das eigene Skript zu prüfen (bei `bash -c` zeigt
+    # $0/BASH_SOURCE auf nichts Sinnvolles), ziehen wir die AKTUELLE Rohdatei
+    # mit Cache-Headern und schauen, ob SIE die Zwei-URL-Logik enthält. Fehlt
+    # sie dort, ist der GitHub-Stand alt (oder der wget-Cache stale) – in beiden
+    # Fällen wäre ein --update mit dem alten Einzeiler wirkungslos.
+    local _remote
+    _remote=$(wget --no-cache --no-cookies --header="Cache-Control: no-cache" -qO- --timeout=15 \
+        "https://raw.githubusercontent.com/HatchetMan111/Elmo-Proxmox/main/install/elmo.sh" 2>/dev/null || true)
+    if [[ -n "$_remote" ]] && ! grep -q 'BETTER_AUTH_URL' <<<"$_remote"; then
+        warn "STALE-CACHE VERDACHT: der aktuelle GitHub-Stand enthält die Zwei-URL-Logik"
+        warn "(BETTER_AUTH_URL) NICHT – vermutlich wurde die Rohdatei noch nicht"
+        warn "gepusht oder der wget-Cache ist stale. Ein --update würde den Fehler"
+        warn "nicht beheben. Bitte den korrekten --no-cache-Einzeiler nutzen:"
         echo "    ${ONE_LINER}"
-        warn "oder direkt prüfen:  grep BETTER_AUTH_URL <(wget --no-cache -qO- <URL>)"
     fi
+    unset _remote
 
     # Bereits vorhanden?
     local existing
