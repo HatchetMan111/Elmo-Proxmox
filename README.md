@@ -22,7 +22,7 @@ Das Script:
 > ein alter Installer lief und neuere Fixes fehlten). Die `INSTALLER_VERSION`
 > am Anfang der Ausgabe zeigt immer, welchen Stand man wirklich erwischt hat.
 
-- erstellt einen **unprivilegierten LXC** (Default: 2 vCPU, 4 GB RAM, 12 GB Disk,
+- erstellt einen **unprivilegierten LXC** (Default: 2 vCPU, 6 GB RAM, 12 GB Disk,
   Debian 13 bevorzugt, `nesting=1 keyctl=1`, `onboot=1`, Hostname `elmo`, nächste
   freie CT-ID ab 200)
 - installiert Docker CE und startet die **4 offiziellen elmo-Images** (kein Build im CT):
@@ -40,7 +40,7 @@ Am Ende bekommst du die URL: `http://<LXC-IP>:1515` (1515 = Default der offiziel
 ### Optionen (hinter dem schließenden Anführungszeichen anhängen)
 
 ```bash
-... " --id 210 --memory 4096 --port 1515
+... " --id 210 --memory 6144 --port 1515
 ... " --ip 192.168.1.50/24 --gateway 192.168.1.1     # statische IP
 ... " --scrape-targets "chatgpt:openrouter:openai/gpt-5-mini:online,google-ai-mode:openrouter:openai/gpt-5-mini:online"
 ... " --onboarding-key sk-or-v1-...                   # LLM-Key + Auto-Target (Schnellweg, empfohlen)

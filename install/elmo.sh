@@ -40,7 +40,7 @@
 set -Eeuo pipefail
 
 # ── Defaults ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="1.0.6"   # wird in --status/-Logs ausgegeben – hilft bei Fehlersuche
+INSTALLER_VERSION="1.0.7"   # wird in --status/-Logs ausgegeben – hilft bei Fehlersuche
 APP_NAME="elmo"
 UPSTREAM_OWNER="elmohq"
 UPSTREAM_REPO="elmo"
@@ -56,8 +56,11 @@ CT_HOSTNAME="elmo"
 CT_STORAGE="local-lvm"
 CT_ROOTFS=12                # GB – Docker-Images (~2 GB) + Postgres (Roh-Antworten wachsen)
 CT_CORES=2                  # Postgres + 2 Node-Services, kein Realtime-Bedarf
-CT_MEMORY=4096              # MB – Postgres + web + worker (Node) + Docker-Overhead
-CT_SWAP=1024                # MB Puffer für Pull/Entpacken-Spitzen
+CT_MEMORY=6144              # MB – Postgres + web + worker (Node) + Docker-Daemon +
+                            # Pull/Entpacken-Spitzen. 4096 war live ZU KNAPP:
+                            # docker compose pull wurde vom OOM-Killer gekillt
+                            # (Exit 137 = SIGKILL, Live 2026-11-23 CT 204).
+CT_SWAP=2048                # MB Puffer für Pull/Entpacken-Spitzen
 CT_BRIDGE="vmbr0"
 CT_IP="dhcp"
 CT_GATEWAY=""               # nur bei statischer IP nötig, z. B. 192.168.1.1
@@ -401,8 +404,9 @@ Optionen (hinter dem schließenden Anführungszeichen anhängen, z. B. ... " --i
   --storage NAME     Storage für rootfs (Default: local-lvm)
   --rootfs GB        Disk-Größe (Default: 12 – Docker-Images + Postgres-Daten)
   --cores N          vCPUs (Default: 2)
-  --memory MB        RAM (Default: 4096 – Postgres + web + worker)
-  --swap MB          Swap (Default: 1024)
+  --memory MB        RAM (Default: 6144 – Postgres + web + worker + Pull-Spitzzen;
+                     4096 war live zu knapp → OOM-Kill beim docker pull, Exit 137)
+  --swap MB          Swap (Default: 2048)
   --bridge BR        Netzwerk-Bridge (Default: vmbr0)
   --ip CIDR          Statt DHCP, z. B. 192.168.1.50/24 (+ --gateway 192.168.1.1)
                      Empfehlenswert: feste IP (oder DHCP-Reservierung), damit die
@@ -746,8 +750,25 @@ echo ">>> IP-abhängige .env-Einträge synchronisieren ..."
 "${APP_DIR}/sync-app-url.sh"
 
 echo ">>> Docker-Images ziehen (elmo-web, elmo-worker, elmo-db-migrate, postgres) ..."
+# Mit Retry: ein abgebrochener Pull (OOM/Netz) soll den ganzen Install nicht
+# killen. Das Docker-Daemon-Flag --max-concurrent-downloads=2 hält die
+# Entpack-Spitzen niedriger (weniger RAM pro Pull) – es muss VOR dem
+# Subcommand stehen, ist aber nur ein daemon-Startparameter; wir nutzen hier
+# den einfachen `docker compose pull` mit Retry (der Daemon läuft bereits).
 systemctl stop elmo >/dev/null 2>&1 || true
-docker compose pull
+pull_ok=0
+for attempt in 1 2 3; do
+    if docker compose pull; then
+        pull_ok=1
+        break
+    fi
+    echo "    Pull-Versuch ${attempt}/3 fehlgeschlagen – warte 10 s und retry ..."
+    sleep 10
+done
+if [[ "$pull_ok" -ne 1 ]]; then
+    die "docker compose pull nach 3 Versuchen fehlgeschlagen.\n  Debug: cd $APP_DIR && docker compose pull\n  (Exit 137 = OOM/externer Kill: CT-RAM erhöhen, z. B. --memory 8192)"
+fi
+ok "Images gepullt"
 
 echo ">>> Elmo-Stack starten (docker compose up -d) ..."
 docker compose up -d
