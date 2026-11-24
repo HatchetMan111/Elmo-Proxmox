@@ -40,7 +40,7 @@
 set -Eeuo pipefail
 
 # ── Defaults ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="1.0.7"   # wird in --status/-Logs ausgegeben – hilft bei Fehlersuche
+INSTALLER_VERSION="1.0.9"   # wird in --status/-Logs ausgegeben – hilft bei Fehlersuche
 APP_NAME="elmo"
 UPSTREAM_OWNER="elmohq"
 UPSTREAM_REPO="elmo"
@@ -81,6 +81,11 @@ SCRAPE_TARGETS_DEFAULT="stub:stub:online"
 SCRAPE_TARGETS=""           # leer = Default oben (Flag --scrape-targets überschreibt)
 OPENROUTER_API_KEY=""       # optional per Flag; Nachrüstung jederzeit in .env
 ONBOARDING_KEY=""           # --onboarding-key: Alias für --openrouter-key + Auto-Target
+TYPESAFE_KEY=""             # --typesafe-key: echter Jev-Judge-Key (statt OpenRouter)
+TYPESAFE_DEFAULT_STUB=true  # solange kein LLM-Key gesetzt: TYPESAFE_API_KEY=stub
+                            # (Stub-Judge "cue words, not Jev" – Worker bootet ohne
+                            # echten Key; Live-Grube 2026-11-23: configureMentionAnalyzer
+                            # wirft sonst beim Boot → Crash-Loop).
 TELEMETRY=false             # DISABLE_TELEMETRY=1 (Elmo sammelt sonst anonyme Telemetrie)
 UNINSTALL=false
 UPDATE=false
@@ -355,6 +360,7 @@ parse_args() {
             --scrape-targets)  SCRAPE_TARGETS="${args[$((i+1))]:-}"; i=$((i+2)) ;;
             --openrouter-key)  OPENROUTER_API_KEY="${args[$((i+1))]:-}"; i=$((i+2)) ;;
             --onboarding-key)  ONBOARDING_KEY="${args[$((i+1))]:-}"; i=$((i+2)) ;;
+            --typesafe-key)    TYPESAFE_KEY="${args[$((i+1))]:-}"; i=$((i+2)) ;;
             --telemetry)       TELEMETRY=true; i=$((i+1)) ;;
             --force)           FORCE_RECREATE=true; i=$((i+1)) ;;
             --yes|-y)          ASSUME_YES=true; i=$((i+1)) ;;
@@ -389,6 +395,18 @@ parse_args() {
             SCRAPE_TARGETS="chatgpt:openrouter:openai/gpt-5-mini:online"
         fi
         ONBOARDING=true
+    fi
+    # --typesafe-key ist der zweite Weg zum echten Jev-Judge (statt OpenRouter).
+    # Wenn ein LLM-Key (OpenRouter ODER TypeSafe) gesetzt ist, wird der
+    # Stub-Judge-Default NICHT gesetzt – sonst würde er den echten Key
+    # überschreiben (createMentionAnalyzer: apiKey?.trim() === "stub" → Stub).
+    # WICHTIG: OPENROUTER_API_KEY kann auch als ENV-Variable gesetzt sein
+    # (Harness/Tests übergeben es so) – nicht nur aus der Optionsliste.
+    if [[ -n "$TYPESAFE_KEY" ]]; then
+        TYPESAFE_DEFAULT_STUB=false
+    fi
+    if [[ -n "$OPENROUTER_API_KEY" ]]; then
+        TYPESAFE_DEFAULT_STUB=false
     fi
 }
 
@@ -664,6 +682,31 @@ if [[ "${APPLY_OPENROUTER:-0}" == "1" ]]; then
     dotenv_set OPENROUTER_API_KEY "${OPENROUTER_KEY_IN}"
     echo "    OPENROUTER_API_KEY gesetzt (per --openrouter-key)"
 fi
+# Jev-Judge-Key (TYPESAFE_API_KEY): der Worker ruft configureMentionAnalyzer()
+# beim BOOT auf – ohne TYPESAFE_API_KEY ODER OPENROUTER_API_KEY wirft er
+# ("Elmo judges mentions and sentiment with Jev: set TYPESAFE_API_KEY, or
+# OPENROUTER_API_KEY") → Crash-Loop (Live-Grube 2026-11-23). Lösung: solange
+# kein echter LLM-Key gesetzt ist, TYPESAFE_API_KEY=stub (Stub-Judge "cue
+# words, not Jev" – Worker bootet, dev/test-tauglich). Mit echtem Key wird der
+# Stub-Default NICHT gesetzt (createMentionAnalyzer: "stub" → Stub, sonst echt).
+if [[ "${APPLY_TYPESAFE:-0}" == "1" ]]; then
+    dotenv_set TYPESAFE_API_KEY "${TYPESAFE_KEY_IN}"
+    echo "    TYPESAFE_API_KEY gesetzt (per --typesafe-key)"
+elif [[ "${APPLY_OPENROUTER:-0}" == "1" ]]; then
+    # Echter OpenRouter-Key vorhanden → einen evtl. aus einem früheren Lauf
+    # stammenden Stub-Judge ENTFERNEN. Sonst bliebe "stub" stehen und
+    # createMentionAnalyzer() würde den Stub statt des echten Keys nutzen
+    # (Live-Relevanz: Erst-Install ohne Key → später --onboarding-key).
+    if [[ "$(dotenv_get TYPESAFE_API_KEY)" == "stub" ]]; then
+        dotenv_set TYPESAFE_API_KEY ""
+        echo "    TYPESAFE_API_KEY=stub entfernt (echter LLM-Key vorhanden)"
+    fi
+elif [[ "${TYPESAFE_DEFAULT_STUB:-true}" == "true" ]]; then
+    if [[ -z "$(dotenv_get TYPESAFE_API_KEY)" ]]; then
+        dotenv_set TYPESAFE_API_KEY "stub"
+        echo "    TYPESAFE_API_KEY=stub (Stub-Judge – Worker bootet ohne echten LLM-Key)"
+    fi
+fi
 chmod 600 .env
 
 echo ">>> Compose-Konfiguration validieren ..."
@@ -839,12 +882,30 @@ run_inner_setup() {
     if [[ -n "$OPENROUTER_API_KEY" ]]; then
         apply_openrouter=1
     fi
+    local apply_typesafe=0
+    if [[ -n "$TYPESAFE_KEY" ]]; then
+        apply_typesafe=1
+    fi
+    # TYPESAFE_DEFAULT_STUB explizit setzen (nicht aus der Env erben) –
+    # parse_args setzt es, aber bei verschachtelten Aufrufen (Harness/Tests)
+    # kann es leer sein → elif-Zweig würde fälschlich stubben.
+    # WICHTIG: OPENROUTER_API_KEY kann auch als ENV-Variable gesetzt sein
+    # (Harness/Tests übergeben es so) – nicht nur aus der Optionsliste.
+    local typesafe_default_stub="${TYPESAFE_DEFAULT_STUB:-true}"
+    if [[ -n "${OPENROUTER_API_KEY:-}" ]]; then
+        typesafe_default_stub=false
+    fi
+    if [[ -n "${TYPESAFE_KEY:-}" ]]; then
+        typesafe_default_stub=false
+    fi
     pct exec "$ct_id" -- env APP_DIR="$APP_DIR" ELMO_VERSION="$ELMO_VERSION" \
         IMAGE_PREFIX="$IMAGE_PREFIX" POSTGRES_IMAGE="$POSTGRES_IMAGE" \
         UI_PORT="$UI_PORT" HOST_DNS="${HOST_DNS:-1.1.1.1}" \
         TELEMETRY="$TELEMETRY" SCRAPE_TARGETS_IN="$scrape_in" \
         OPENROUTER_KEY_IN="$OPENROUTER_API_KEY" APPLY_SCRAPE="$apply_scrape" \
         APPLY_OPENROUTER="$apply_openrouter" ONBOARDING="$ONBOARDING" \
+        TYPESAFE_KEY_IN="$TYPESAFE_KEY" APPLY_TYPESAFE="$apply_typesafe" \
+        TYPESAFE_DEFAULT_STUB="$typesafe_default_stub" \
         bash -c 'set -o pipefail; bash /root/setup-inner.sh 2>&1 | tee /var/log/elmo-setup.log'
 }
 
@@ -946,6 +1007,9 @@ print_summary() {
     echo -e "  ${CYAN}Meldung erscheint):${NC}"
     echo "     LLM-Key (Onboarding + Opportunities – EINER reicht):"
     echo "       ${ONE_LINER} --update --onboarding-key sk-or-v1-...     # OpenRouter"
+    echo "       ${ONE_LINER} --update --typesafe-key ts-...             # TypeSafe (Jev)"
+    echo "     (Ohne LLM-Key läuft der Worker mit Stub-Judge 'cue words, not"
+    echo "      Jev' – die UI ist erreichbar, aber ohne echte AI-Wertung.)"
     echo "     Scraper (echte ChatGPT-/Gemini-/Google-AI-Antworten – ohne Keys"
     echo "     läuft der Worker im Stub-Modus, 'no network'):"
     echo "       Key in ${APP_DIR}/.env ergänzen (z. B. CLORO_API_KEY=...), dann:"
@@ -1225,13 +1289,25 @@ do_status() {
     # Onboarding/Opportunities brauchen EINEN LLM-Key (OpenRouter | OpenAI |
     # Anthropic | Mistral). Scraper-Keys (Cloro/BrightData/...) liefern die
     # echten Engine-Antworten. Werte werden NIE ausgegeben, nur gesetzt/nicht.
-    local -a llm_keys=(OPENROUTER_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY MISTRAL_API_KEY)
+    # TYPESAFE_API_KEY=stub zählt als gesetzt (Stub-Judge) – sonst würde
+    # --status fälschlich "Missing environment configuration" warnen, obwohl
+    # der Worker mit Stub-Judge läuft.
+    local -a llm_keys=(OPENROUTER_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY MISTRAL_API_KEY TYPESAFE_API_KEY)
     local -a scraper_keys=(CLORO_API_KEY BRIGHTDATA_API_TOKEN SEARCHAPI_API_KEY OLOSTEP_API_KEY OXYLABS_USERNAME DATAFORSEO_LOGIN)
-    local -a llm_set=() llm_missing=() scraper_set=() llm_any=false
+    local -a llm_set=() llm_missing=() scraper_set=() llm_any=false llm_stub=false
     local k v
     for k in "${llm_keys[@]}"; do
         v=$(pct exec "$ct_id" -- sed -n "s/^${k}=//p" "${APP_DIR}/.env" 2>/dev/null | head -1 || true)
-        if [[ -n "$v" ]]; then llm_set+=("$k"); llm_any=true; else llm_missing+=("$k"); fi
+        if [[ -n "$v" ]]; then
+            llm_set+=("$k")
+            if [[ "$k" == "TYPESAFE_API_KEY" && "$v" == "stub" ]]; then
+                llm_stub=true   # Stub-Judge: kein echter LLM-Key
+            else
+                llm_any=true
+            fi
+        else
+            llm_missing+=("$k")
+        fi
     done
     for k in "${scraper_keys[@]}"; do
         v=$(pct exec "$ct_id" -- sed -n "s/^${k}=//p" "${APP_DIR}/.env" 2>/dev/null | head -1 || true)
@@ -1239,6 +1315,10 @@ do_status() {
     done
     if $llm_any; then
         ok "LLM-Key:   gesetzt (${llm_set[*]}) – Onboarding/Opportunities können laufen"
+    elif $llm_stub; then
+        ok "LLM-Key:   Stub-Judge (TYPESAFE_API_KEY=stub) – Worker läuft, aber nur"
+        ok "           Cue-Word-Judging (kein echter LLM-Judge). Für echte Results:"
+        ok "             ${ONE_LINER} --update --onboarding-key sk-or-v1-..."
     else
         warn "LLM-Key:   NICHT gesetzt – die UI zeigt 'Missing environment configuration'!"
         warn "           Onboarding/Opportunities brauchen EINEN Key:"

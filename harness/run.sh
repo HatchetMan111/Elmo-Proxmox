@@ -760,6 +760,7 @@ assert_fcontains "$ENV_PATH" "SCRAPE_TARGETS=stub:stub:online"
 assert_fregex "$ENV_PATH" '^APP_URL=http://'"$CT_IP"':1515$'
 assert_fregex "$ENV_PATH" '^VITE_APP_URL=http://'"$CT_IP"':1515$'
 assert_fregex "$ENV_PATH" '^BETTER_AUTH_URL=http://127.0.0.1:1515$'
+assert_fcontains "$ENV_PATH" "TYPESAFE_API_KEY=stub"
 assert_no_fcontains "$ENV_PATH" "OPENROUTER_API_KEY"
 env_mode=$(/bin/stat -c '%a' "$ENV_PATH" 2>/dev/null || echo "?")
 if [[ "$env_mode" == "600" ]]; then pass ".env chmod 600"
@@ -803,12 +804,29 @@ ec=$(run_installer --openrouter-key "sk-or-v1-test123"); assert_exit 0 "$ec"
 assert_fcontains "$ENV_PATH" "OPENROUTER_API_KEY=sk-or-v1-test123"
 assert_out "OPENROUTER_API_KEY gesetzt (per --openrouter-key)"
 
+t "Install mit --openrouter-key: Stub-Judge-Default wird NICHT gesetzt"
+reset_state
+ec=$(run_installer --openrouter-key "sk-or-v1-test123"); assert_exit 0 "$ec"
+assert_no_fcontains "$ENV_PATH" "TYPESAFE_API_KEY=stub"
+
+t "Install mit --typesafe-key (echter Jev-Judge ohne OpenRouter)"
+reset_state
+ec=$(run_installer --typesafe-key "ts-live-abc"); assert_exit 0 "$ec"
+assert_fcontains "$ENV_PATH" "TYPESAFE_API_KEY=ts-live-abc"
+assert_out "TYPESAFE_API_KEY gesetzt (per --typesafe-key)"
+assert_no_fcontains "$ENV_PATH" "TYPESAFE_API_KEY=stub"
+
 t "Install mit --onboarding-key (Schnellweg: Key + Auto-Target)"
 reset_state
 ec=$(run_installer --onboarding-key "sk-or-v1-onb"); assert_exit 0 "$ec"
 assert_fcontains "$ENV_PATH" "OPENROUTER_API_KEY=sk-or-v1-onb"
 assert_fcontains "$ENV_PATH" "SCRAPE_TARGETS=chatgpt:openrouter:openai/gpt-5-mini:online"
 assert_out "OPENROUTER_API_KEY gesetzt (per --openrouter-key)"
+
+t "Install mit --onboarding-key: Stub-Judge-Default wird NICHT gesetzt"
+reset_state
+ec=$(run_installer --onboarding-key "sk-or-v1-onb"); assert_exit 0 "$ec"
+assert_no_fcontains "$ENV_PATH" "TYPESAFE_API_KEY=stub"
 
 t "--onboarding-key + --openrouter-key (unterschiedlich) → die()"
 reset_state
@@ -1047,6 +1065,14 @@ assert_out "LLM-Key:   NICHT gesetzt"
 assert_out "Missing environment configuration"
 assert_out "Scraper:   KEINER gesetzt"
 assert_out "Web-UI:    http://10.120.5.42:1515  (HTTP 200)"
+
+t "--status: Stub-Judge (TYPESAFE_API_KEY=stub) → LLM-Key ok, kein echter Key"
+seed_ct
+/bin/grep -q '^TYPESAFE_API_KEY=' "$ENV_PATH" || echo "TYPESAFE_API_KEY=stub" >> "$ENV_PATH"
+ec=$(run_installer --status); assert_exit 0 "$ec"
+assert_out "LLM-Key:   Stub-Judge (TYPESAFE_API_KEY=stub)"
+assert_out "Cue-Word-Judging"
+assert_no_out "Missing environment configuration"
 
 t "--status: OpenRouter-Key gesetzt → LLM-Key ok (kein Wert im Log!)"
 seed_ct
