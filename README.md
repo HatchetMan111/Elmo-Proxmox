@@ -83,6 +83,17 @@ bash -c "$(wget --no-cache --no-cookies --header="Cache-Control: no-cache" -qLO 
 
 `--status` zeigt jederzeit, welche Keys gesetzt sind (nur Namen, **nie** Werte) –
 inkl. „LLM-Key“ (Onboarding/Opportunities) und „Scraper“ (echte Engine-Antworten).
+Außerdem repliziert `--status` den **Env-Check der Web-UI** (elmo 0.7.12
+`getEnvValidationState`, Modus `local`): statische Pflicht-Keys
+(`DATABASE_URL`, `BETTER_AUTH_SECRET`, `SCRAPE_TARGETS`, `ELMO_ENCRYPTION_KEY`,
+`DEPLOYMENT_MODE`), die aus `SCRAPE_TARGETS` abgeleiteten Provider-Keys
+(z. B. `cloro` → `CLORO_API_KEY`) und den Research-Provider für
+Onboarding/Opportunities (`OPENAI_API_KEY`/`OPENROUTER_API_KEY`/
+`ANTHROPIC_API_KEY`/`MISTRAL_API_KEY` – alternativ `ONBOARDING_LLM_TARGET` +
+dessen Provider-Key). Fehlt etwas, listet `--status` exakt die Einträge, die die
+UI als „Missing environment configuration“ anzeigt. (Hinweis: die UI zählt über
+`withStoredCredentials()` zusätzlich in der DB gespeicherte Provider-Keys –
+`--status` prüft nur die `.env`.)
 
 `SCRAPE_TARGETS` bestimmt, welche Engines getrackt werden (Format
 `modell:provider[:version][:online]`, kommasepariert). Default: **`stub:stub:online`**
@@ -138,7 +149,7 @@ bash -c "$(wget --no-cache --no-cookies --header="Cache-Control: no-cache" -qLO 
 ## Status / Deinstallation / Debug
 
 ```bash
-... " --status      # Service, Stack, Keys-Status, Web-UI-Erreichbarkeit
+... " --status      # Service, Stack, Keys-Status, Env-Check (UI-Missing-env-Liste), Web-UI-Erreichbarkeit
 ... " --uninstall   # Container stoppen + löschen (ALLE Daten weg!); --yes überspringt Rückfrage
 ... " --debug       # voller bash -x-Trace
 ```
