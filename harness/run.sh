@@ -1094,6 +1094,9 @@ assert_out "Scrape:    chatgpt:cloro:online,google-ai-mode:cloro:online"
 assert_out "LLM-Key:   NICHT gesetzt"
 assert_out "Missing environment configuration"
 assert_out "Scraper:   KEINER gesetzt"
+assert_out "Env-Check:"
+assert_out "✘ CLORO_API_KEY (SCRAPE_TARGETS provider \"cloro\")"
+assert_out "✘ OPENAI_API_KEY or OPENROUTER_API_KEY or ANTHROPIC_API_KEY or MISTRAL_API_KEY"
 assert_out "Web-UI:    http://10.120.5.42:1515  (HTTP 200)"
 
 t "--status: Stub-Judge (TYPESAFE_API_KEY=stub) → LLM-Key ok, kein echter Key"
@@ -1102,7 +1105,10 @@ seed_ct
 ec=$(run_installer --status); assert_exit 0 "$ec"
 assert_out "LLM-Key:   Stub-Judge (TYPESAFE_API_KEY=stub)"
 assert_out "Cue-Word-Judging"
-assert_no_out "Missing environment configuration"
+assert_no_out "LLM-Key:   NICHT gesetzt"
+# Env-Check flaggt trotzdem: stub ist kein Research-Provider, CLORO fehlt
+assert_out "✘ CLORO_API_KEY"
+assert_out "✘ OPENAI_API_KEY or OPENROUTER_API_KEY"
 
 t "--status: OpenRouter-Key gesetzt → LLM-Key ok (kein Wert im Log!)"
 seed_ct
@@ -1110,6 +1116,26 @@ seed_ct
 ec=$(run_installer --status); assert_exit 0 "$ec"
 assert_out "LLM-Key:   gesetzt (OPENROUTER_API_KEY)"
 assert_no_out "sk-or-secret-abc123"
+# Research-Provider erfüllt, aber SCRAPE_TARGETS-cloro fehlt weiterhin:
+assert_out "✘ CLORO_API_KEY (SCRAPE_TARGETS provider \"cloro\")"
+assert_no_out "✘ OPENAI_API_KEY or OPENROUTER_API_KEY"
+
+t "--status: Env-Check – LLM-Key + CLORO gesetzt → alle elmo-Requirements erfüllt"
+seed_ct
+/bin/grep -q '^OPENROUTER_API_KEY=' "$ENV_PATH" || echo "OPENROUTER_API_KEY=sk-or-secret-abc123" >> "$ENV_PATH"
+/bin/grep -q '^CLORO_API_KEY=' "$ENV_PATH" || echo "CLORO_API_KEY=cloro-secret-xyz" >> "$ENV_PATH"
+ec=$(run_installer --status); assert_exit 0 "$ec"
+assert_out "Env-Check:  alle elmo-Requirements erfüllt"
+assert_no_out "✘ CLORO_API_KEY"
+assert_no_out "✘ OPENAI_API_KEY or OPENROUTER_API_KEY"
+
+t "--status: Env-Check – ONBOARDING_LLM_TARGET + passender Provider-Key erfüllt Research-Requirement"
+seed_ct
+/bin/sed -i 's|^SCRAPE_TARGETS=.*|SCRAPE_TARGETS=stub:stub:online|' "$ENV_PATH"
+/bin/grep -q '^ONBOARDING_LLM_TARGET=' "$ENV_PATH" || echo "ONBOARDING_LLM_TARGET=chatgpt:cloro:online" >> "$ENV_PATH"
+/bin/grep -q '^CLORO_API_KEY=' "$ENV_PATH" || echo "CLORO_API_KEY=cloro-secret-xyz" >> "$ENV_PATH"
+ec=$(run_installer --status); assert_exit 0 "$ec"
+assert_out "Env-Check:  alle elmo-Requirements erfüllt"
 
 t "--status: Host_curl_fail → Warnung mit HTTP 000"
 seed_ct
