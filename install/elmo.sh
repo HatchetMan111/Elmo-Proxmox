@@ -40,7 +40,7 @@
 set -Eeuo pipefail
 
 # ── Defaults ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="1.0.9"   # wird in --status/-Logs ausgegeben – hilft bei Fehlersuche
+INSTALLER_VERSION="1.0.10"  # wird in --status/-Logs ausgegeben – hilft bei Fehlersuche
 APP_NAME="elmo"
 UPSTREAM_OWNER="elmohq"
 UPSTREAM_REPO="elmo"
@@ -436,7 +436,7 @@ Optionen (hinter dem schließenden Anführungszeichen anhängen, z. B. ... " --i
   --version V        elmo-Image-Pin überschreiben (Default: 0.7.12)
   --scrape-targets S SCRAPE_TARGETS setzen (Format: modell:provider[:version][:online],
                      z. B. "chatgpt:openrouter:openai/gpt-5-mini:online,perplexity:perplexity-api")
-                     Default: stub:main (keyless – Worker bootet ohne Keys)
+                     Default: stub:stub:online (keyless – Worker bootet ohne Keys)
   --openrouter-key K OpenRouter-API-Key direkt in die .env schreiben (optional)
   --onboarding-key K Alias für --openrouter-key + schaltet SCRAPE_TARGETS
                      automatisch auf ein passendes Echt-Target um (kein Setup-
@@ -527,6 +527,8 @@ echo ">>> Compose-Datei schreiben (Template der offiziellen @elmohq/cli, gehärt
 #    Crash (docker-seitig; zusätzlich überwacht systemd den ganzen Stack)
 #  - db-migrate ist ein One-Shot (kein restart) – web/worker starten erst,
 #    wenn die Migration erfolgreich durch ist (service_completed_successfully)
+#    UND postgres healthy ist (service_healthy) – sonst EAI_AGAIN-Race beim
+#    ersten DB-Connect des Workers (Live 2026-11-24: "getaddrinfo EAI_AGAIN postgres")
 mkdir -p "$APP_DIR"
 cat > "$APP_DIR/docker-compose.yaml" <<COMPEOF
 name: elmo
@@ -566,6 +568,8 @@ services:
     depends_on:
       db-migrate:
         condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
   worker:
     image: ${IMAGE_PREFIX}-worker:${ELMO_VERSION}
     restart: unless-stopped
@@ -576,6 +580,8 @@ services:
     depends_on:
       db-migrate:
         condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
 
 volumes:
   postgres_data:
@@ -648,19 +654,23 @@ fi
 [[ -n "$(dotenv_get VITE_APP_NAME)" ]]   || dotenv_set VITE_APP_NAME "Elmo"
 [[ -n "$(dotenv_get VITE_APP_ICON)" ]]   || dotenv_set VITE_APP_ICON "/icons/elmo-icon.svg"
 [[ -n "$(dotenv_get DATABASE_URL)" ]]    || dotenv_set DATABASE_URL "postgres://postgres:postgres@postgres:5432/elmo"
-# WICHTIG – die Zwei-URL-Aufteilung (Live-Grube "Invalid origin" 2026-11-22):
-#  • APP_URL = die ECHTE Origin (http://<CT-IP>:<PORT>) – Better Auth prüft
-#    dagegen die Browser-Origin beim Login/Registrieren. Mit Loopback hier
-#    scheitert jeder Login vom LAN ("Invalid origin")!
-#  • BETTER_AUTH_URL = Loopback (http://127.0.0.1:<PORT>) – die MCP-Auth liest
-#    die baseURL (APP_URL || BETTER_AUTH_URL) und akzeptiert für die MCP-
-#    Resource-ID NUR https/localhost/127.x → ohne diesen Pin Boot-500.
-#  Beide zusammen: web bootet (MCP ok) UND Login/Registrierung vom LAN ok.
-#  sync-app-url.sh hält beide synchron (nur http, kein https → Domain-Modus
-#  mit echter https-APP_URL lässt alles unverändert).
+# WICHTIG – URL-Logik (Live-Boot-500 2026-11-24, korrigiert in v1.0.10):
+#  elmo 0.7.12 liest die Auth-baseURL aus APP_URL || VITE_APP_URL (BETTER_AUTH_URL
+#  wird NICHT gelesen!) und die MCP-Auth (mcpResource) akzeptiert für ihre
+#  Resource-ID NUR https:// ODER localhost/127.x. Ist APP_URL eine LAN-IP
+#  (http://<CT-IP>:<PORT>), wirft web beim Boot "APP_URL must be an HTTPS URL
+#  (or localhost) ..." → HTTP 500 (genau das Live-Desaster vom 2026-11-24).
+#  Deshalb: APP_URL / VITE_APP_URL / BETTER_AUTH_URL = LOOPBACK
+#  (http://127.0.0.1:<PORT>) – web bootet garantiert, MCP-Resource-ID ist ok.
+#  Die LAN-Origin kommt in BETTER_AUTH_TRUSTED_ORIGINS (kommasepariert) – Better
+#  Auth vertraut ihr dann die Browser-Origin beim Login/Registrieren, sonst
+#  scheitert jeder LAN-Login mit "Invalid origin" (Live-Grube 2026-11-22).
+#  sync-app-url.sh hält das synchron und migriert Legacy-APP_URLs (LAN-IP);
+#  Domain-Modus (https://-APP_URL) lässt alles unverändert.
 [[ -n "$(dotenv_get APP_URL)" ]]         || dotenv_set APP_URL "http://127.0.0.1:${UI_PORT}"
 [[ -n "$(dotenv_get BETTER_AUTH_URL)" ]] || dotenv_set BETTER_AUTH_URL "http://127.0.0.1:${UI_PORT}"
 [[ -n "$(dotenv_get VITE_APP_URL)" ]]    || dotenv_set VITE_APP_URL "http://127.0.0.1:${UI_PORT}"
+[[ -n "$(dotenv_get BETTER_AUTH_TRUSTED_ORIGINS)" ]] || dotenv_set BETTER_AUTH_TRUSTED_ORIGINS "http://127.0.0.1:${UI_PORT}"
 # Telemetrie: AUS ist Default (--telemetry erlaubt sie). Leerer Wert = erlaubt,
 # "1" = aus (die CLI prüft Boolean(process.env.DISABLE_TELEMETRY) – "0" wäre
 # wahrheitsähnlich und würde fälschlich deaktivieren, deshalb Leere statt 0).
@@ -712,27 +722,26 @@ chmod 600 .env
 echo ">>> Compose-Konfiguration validieren ..."
 docker compose config -q || die "docker compose config meldet Fehler (Compose-Datei/.env prüfen).\n  Debug: cd $APP_DIR && docker compose config"
 
-echo ">>> APP-URL-Sync-Script schreiben (APP_URL = echte IP, BETTER_AUTH_URL = Loopback) ..."
-# Live-Gruben 2026-11-22 (zwei gegenläufige Zwänge):
-#  1. MCP-Auth (packages/lib/src/auth/server.ts:mcpResource) verlangt für die
-#     MCP-Resource-ID zwingend https:// ODER localhost/127.x – NODE_ENV=production
-#     ist im Image fix, "localhost" greift also nicht als localOrigin. Die
-#     baseURL (APP_URL || BETTER_AUTH_URL) muss deshalb loopback-akzeptiert sein,
-#     sonst Boot-500.
-#  2. Better Auth prüft beim Login/Registrieren die Browser-Origin gegen
-#     APP_URL (trustedOrigins) – ist APP_URL ein Loopback, scheitert JEDER Login
-#     vom LAN mit "Invalid origin".
-# Lösung: APP_URL = echte Origin (http://<CT-IP>:<PORT>), BETTER_AUTH_URL =
-# Loopback (http://127.0.0.1:<PORT>). Die Zwei-URL-Aufteilung erfüllt beide:
-# web bootet (MCP sieht Loopback) UND Login/Registrierung vom LAN klappen
-# (Better Auth vertraut der echten Origin). Email/Login-Redirects sind relativ
-# (safeReturnTo) – kein Problem. Wer MCP braucht, setzt eine https://-APP_URL
-# (Domain-Modus: dann greift weder IP- noch Loopback-Sync).
+echo ">>> APP-URL-Sync-Script schreiben (APP_URL = Loopback, LAN-Origin → BETTER_AUTH_TRUSTED_ORIGINS) ..."
+# URL-Logik v1.0.10 (Live-Boot-500 2026-11-24): elmo 0.7.12 liest die Auth-baseURL
+# aus APP_URL || VITE_APP_URL (BETTER_AUTH_URL wird NICHT gelesen) und mcpResource
+# akzeptiert für die MCP-Resource-ID nur https:// ODER localhost/127.x. Ist APP_URL
+# eine LAN-IP, bootet web mit HTTP 500 ("must be an HTTPS URL ... Got http://<IP>").
+# Lösung: APP_URL/VITE_APP_URL/BETTER_AUTH_URL = Loopback; die LAN-Origin wandert in
+# BETTER_AUTH_TRUSTED_ORIGINS (Better-Auth trustedOrigins → Login vom LAN klappt,
+# sonst "Invalid origin", Live-Grube 2026-11-22). Domain-Modus (https://-APP_URL):
+# Sync greift nicht. Legacy-Migration: APP_URL mit LAN-IP (altes Sync-Script) wird
+# auf Loopback umgestellt, die LAN-IP in TRUSTED_ORIGINS übernommen.
 cat > "${APP_DIR}/sync-app-url.sh" <<SYNCEOF
 #!/usr/bin/env bash
-# Hält APP_URL (echte CT-IP-Origin, für Better-Auth trustedOrigins) und
-# BETTER_AUTH_URL (Loopback, für die MCP-Resource-ID) synchron.
-# Domain-Modus: beginnt APP_URL mit https://, greift NICHTS (Sync macht nichts).
+# Hält die URL-Keys in .env synchron (elmo 0.7.12: Auth-baseURL = APP_URL ||
+# VITE_APP_URL; MCP-Resource-ID akzeptiert NUR https:// oder Loopback).
+#  • APP_URL / VITE_APP_URL / BETTER_AUTH_URL = LOOPBACK http://127.0.0.1:<PORT>
+#    (web bootet garantiert – LAN-IP in APP_URL wäre Boot-500, Live 2026-11-24)
+#  • BETTER_AUTH_TRUSTED_ORIGINS = Loopback + echte LAN-Origin http://<IP>:<PORT>
+#    (Better-Auth trustedOrigins → Login/Registrierung vom LAN klappt)
+#  • Legacy: APP_URL mit LAN-IP (altes Sync-Script) → Loopback + TRUSTED_ORIGINS
+#  • Domain-Modus: beginnt APP_URL mit https://, greift NICHTS (Sync macht nichts).
 set -euo pipefail
 SELF_DIR=\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)
 cd "\$SELF_DIR"
@@ -748,17 +757,22 @@ case "\$CURRENT" in
     https://*) echo "elmo-sync: Domain-Modus (APP_URL=\$CURRENT) – kein Sync"; exit 0 ;;
 esac
 IP=\$(ip -4 addr show eth0 scope global 2>/dev/null | awk '/inet /{print \$2; exit}' | cut -d/ -f1 || true)
-[[ -n "\$IP" ]] || { echo "elmo-sync: keine globale IPv4 an eth0 – .env bleibt unverändert"; exit 0; }
-WANT_APP="http://\${IP}:${UI_PORT}"
-WANT_AUTH="http://127.0.0.1:${UI_PORT}"
-if [[ "\$CURRENT" != "\$WANT_APP" ]]; then
-    echo "elmo-sync: APP_URL=\${CURRENT:-unbekannt} → \$WANT_APP (echte IP-Origin)"
+LOOPBACK="http://127.0.0.1:${UI_PORT}"
+if [[ -n "\$IP" ]]; then
+    WANT_TRUSTED="\$LOOPBACK,http://\${IP}:${UI_PORT}"
 else
-    echo "elmo-sync: APP_URL unverändert (\$WANT_APP)"
+    WANT_TRUSTED="\$LOOPBACK"
+    echo "elmo-sync: keine globale IPv4 an eth0 – Trusted Origins nur Loopback"
 fi
-set_key APP_URL "\$WANT_APP"
-set_key VITE_APP_URL "\$WANT_APP"
-set_key BETTER_AUTH_URL "\$WANT_AUTH"
+if [[ "\$CURRENT" != "\$LOOPBACK" ]]; then
+    echo "elmo-sync: APP_URL=\${CURRENT:-unbekannt} → \$LOOPBACK (Loopback-Pin; LAN-Origin wandert in BETTER_AUTH_TRUSTED_ORIGINS)"
+else
+    echo "elmo-sync: APP_URL unverändert (\$LOOPBACK)"
+fi
+set_key APP_URL "\$LOOPBACK"
+set_key VITE_APP_URL "\$LOOPBACK"
+set_key BETTER_AUTH_URL "\$LOOPBACK"
+set_key BETTER_AUTH_TRUSTED_ORIGINS "\$WANT_TRUSTED"
 SYNCEOF
 chmod +x "${APP_DIR}/sync-app-url.sh"
 
@@ -833,6 +847,12 @@ for _ in $(seq 1 60); do
     sleep 5
 done
 if [[ -z "$WEB_OK" ]]; then
+    # Boot-500-Regression (Live 2026-11-24): elmo 0.7.12 liest APP_URL || VITE_APP_URL
+    # als Auth-baseURL; mcpResource akzeptiert nur https/Loopback. Ist APP_URL eine
+    # LAN-IP, loggt web "APP_URL must be an HTTPS URL (or localhost) ..." → 500.
+    if docker compose logs --tail 200 web 2>/dev/null | /bin/grep -q 'must be an HTTPS URL'; then
+        die "web bootet nicht: 'must be an HTTPS URL' in den Logs – APP_URL/VITE_APP_URL in ${APP_DIR}/.env ist eine LAN-IP (kein Loopback).\n  Fix: cd $APP_DIR && ./sync-app-url.sh (setzt APP_URL=http://127.0.0.1:${UI_PORT} + BETTER_AUTH_TRUSTED_ORIGINS mit der LAN-Origin) && docker compose up -d"
+    fi
     die "Web-UI antwortet nicht (letzter HTTP-Code: ${code:-keiner}).\n  Debug: cd $APP_DIR && docker compose ps -a && docker compose logs --tail 50 web\n  (db-migrate muss erfolgreich durch sein, bevor 'web' startet)"
 fi
 ok "Web-UI antwortet (HTTP ${code})"
@@ -1020,10 +1040,11 @@ print_summary() {
     echo "      sonst bootet der Worker nicht – siehe README.)"
     echo ""
     echo -e "  ${CYAN}MCP-Server (für Claude & Co.):${NC}"
-    echo "  Die Web-UI läuft; der MCP-Endpunkt http://${ct_ip}:${UI_PORT}/api/mcp"
-    echo "  braucht eine https://-APP_URL (oder localhost) – setze dafür in"
-    echo "  ${APP_DIR}/.env APP_URL=https://deine-domain.example (Reverse-Proxy),"
-    echo "  der Loopback-Pin greift dann nicht mehr."
+    echo "  Die Web-UI läuft; APP_URL bleibt Loopback (http://127.0.0.1:${UI_PORT}) –"
+    echo "  das ist Pflicht, sonst bootet web mit HTTP 500 (MCP braucht https/Loopback)."
+    echo "  Die LAN-Origin http://${ct_ip}:${UI_PORT} steht in BETTER_AUTH_TRUSTED_ORIGINS"
+    echo "  (Login vom LAN). Für externe MCP-Clients: ${APP_DIR}/.env auf"
+    echo "  APP_URL=https://deine-domain.example (Reverse-Proxy) – der Sync greift dann nicht."
     echo ""
     echo -e "  ${CYAN}Nützliche Befehle (exakt kopierbar):${NC}"
     echo "  Status:    ${ONE_LINER} --status"
@@ -1035,8 +1056,9 @@ print_summary() {
     warn "postgres_data im CT – ein --update erhält sie, pct destroy löscht sie."
     warn "Für Backups: pct backup / vzdump."
     if [[ "$CT_IP" == "dhcp" ]]; then
-        warn "CT hat DHCP – die APP_URL ist auf 127.0.0.1 gepinnt (unabhängig"
-        warn "von der CT-IP); trotzdem empfohlen: DHCP-Reservierung im Router."
+        warn "CT hat DHCP – APP_URL bleibt Loopback (unabhängig von der CT-IP),"
+        warn "die LAN-Origin wird per sync-app-url.sh in BETTER_AUTH_TRUSTED_ORIGINS"
+        warn "eingetragen; trotzdem empfohlen: DHCP-Reservierung im Router."
     fi
 }
 
@@ -1052,20 +1074,21 @@ do_install() {
         die "pct nicht gefunden – das Script muss auf einem Proxmox-VE-Host laufen."
     fi
 
-    # Selbstdiagnose: STALE-CACHE erkennen (Live-Grube 2026-11-23). Ein alter
-    # Installer (< v1.0.4) hat die Zwei-URL-Logik nicht – das Resultat ist ein
-    # Boot-500 von web mit "access token is bound to http://<IP>:1515/api/mcp"
-    # (statt 127.0.0.1). Statt das eigene Skript zu prüfen (bei `bash -c` zeigt
-    # $0/BASH_SOURCE auf nichts Sinnvolles), ziehen wir die AKTUELLE Rohdatei
-    # mit Cache-Headern und schauen, ob SIE die Zwei-URL-Logik enthält. Fehlt
-    # sie dort, ist der GitHub-Stand alt (oder der wget-Cache stale) – in beiden
-    # Fällen wäre ein --update mit dem alten Einzeiler wirkungslos.
+    # Selbstdiagnose: STALE-CACHE erkennen (Live-Grube 2026-11-23/24). Ein alter
+    # Installer (< v1.0.10) kennt die URL-Logik mit BETTER_AUTH_TRUSTED_ORIGINS
+    # nicht – das Resultat ist ein Boot-500 von web ("APP_URL must be an HTTPS
+    # URL ... Got http://<IP>:1515", wenn APP_URL die LAN-IP ist). Statt das
+    # eigene Skript zu prüfen (bei `bash -c` zeigt $0/BASH_SOURCE auf nichts
+    # Sinnvolles), ziehen wir die AKTUELLE Rohdatei mit Cache-Headern und schauen,
+    # ob SIE die URL-Logik enthält. Fehlt sie dort, ist der GitHub-Stand alt
+    # (oder der wget-Cache stale) – in beiden Fällen wäre ein --update mit dem
+    # alten Einzeiler wirkungslos.
     local _remote
     _remote=$(wget --no-cache --no-cookies --header="Cache-Control: no-cache" -qO- --timeout=15 \
         "https://raw.githubusercontent.com/HatchetMan111/Elmo-Proxmox/main/install/elmo.sh" 2>/dev/null || true)
-    if [[ -n "$_remote" ]] && ! grep -q 'BETTER_AUTH_URL' <<<"$_remote"; then
-        warn "STALE-CACHE VERDACHT: der aktuelle GitHub-Stand enthält die Zwei-URL-Logik"
-        warn "(BETTER_AUTH_URL) NICHT – vermutlich wurde die Rohdatei noch nicht"
+    if [[ -n "$_remote" ]] && ! grep -q 'BETTER_AUTH_TRUSTED_ORIGINS' <<<"$_remote"; then
+        warn "STALE-CACHE VERDACHT: der aktuelle GitHub-Stand enthält die URL-Logik"
+        warn "(BETTER_AUTH_TRUSTED_ORIGINS) NICHT – vermutlich wurde die Rohdatei noch nicht"
         warn "gepusht oder der wget-Cache ist stale. Ein --update würde den Fehler"
         warn "nicht beheben. Bitte den korrekten --no-cache-Einzeiler nutzen:"
         echo "    ${ONE_LINER}"
@@ -1275,11 +1298,15 @@ do_status() {
     fi
 
     # Konfiguration (ohne Secrets auszugeben – nur KEY-Status, nie Werte)
-    local app_url scrape
+    local app_url trusted scrape
     app_url=$(pct exec "$ct_id" -- sed -n 's/^APP_URL=//p' "${APP_DIR}/.env" 2>/dev/null | head -1 || true)
+    trusted=$(pct exec "$ct_id" -- sed -n 's/^BETTER_AUTH_TRUSTED_ORIGINS=//p' "${APP_DIR}/.env" 2>/dev/null | head -1 || true)
     scrape=$(pct exec "$ct_id" -- sed -n 's/^SCRAPE_TARGETS=//p' "${APP_DIR}/.env" 2>/dev/null | head -1 || true)
     if [[ -n "$app_url" ]]; then
         info "APP_URL:   $app_url"
+    fi
+    if [[ -n "$trusted" ]]; then
+        info "Trusted:   $trusted"
     fi
     if [[ -n "$scrape" ]]; then
         info "Scrape:    $scrape"
@@ -1361,3 +1388,4 @@ elif $STATUS_CHECK; then
 else
     do_install
 fi
+
