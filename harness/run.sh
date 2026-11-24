@@ -10,7 +10,7 @@
 #  Usage: bash harness/run.sh [-v]   (Exit 0 = alle Cases grün)
 # =============================================================================
 set -u
-SCRIPT="/home/phil/Proxmox-Scripts/Elmo-Proxmox/install/elmo.sh"
+SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/install/elmo.sh"
 [[ -f "$SCRIPT" ]] || { echo "✘ Installer nicht gefunden: $SCRIPT"; exit 1; }
 
 MK=$(mktemp -d /tmp/elmo-harness.XXXXXX)
@@ -348,7 +348,7 @@ echo "wget $*" >> "$HS/calls.log" 2>/dev/null || true
 case "$url" in
     https://raw.githubusercontent.com/HatchetMan111/Elmo-Proxmox/main/install/elmo.sh)
         # Selbstdiagnose-Fixture (identisch zu mock-curl): aktuelle Rohdatei
-        # MIT Zwei-URL-Logik; mit $HS/remote_without_auth_url ohne (alter Stand).
+        # MIT URL-Logik (BETTER_AUTH_TRUSTED_ORIGINS); mit $HS/remote_without_auth_url ohne (alter Stand).
         if [[ -f "$HS/remote_without_auth_url" ]]; then
             cat <<'REMOTESTALE'
 #!/usr/bin/env bash
@@ -358,7 +358,7 @@ REMOTESTALE
             cat <<'REMOTEFIX'
 #!/usr/bin/env bash
 INSTALLER_VERSION="9.9.9"
-BETTER_AUTH_URL="http://127.0.0.1:1515"
+BETTER_AUTH_TRUSTED_ORIGINS="http://127.0.0.1:1515"
 REMOTEFIX
         fi
         exit 0 ;;
@@ -402,11 +402,11 @@ STUB
         chmod +x "$outfile"
         exit 0 ;;
     https://raw.githubusercontent.com/HatchetMan111/Elmo-Proxmox/main/install/elmo.sh)
-        # Selbstdiagnose-Fixture: die "aktuelle Rohdatei" mit Zwei-URL-Logik.
-        # Der Installer prüft per grep BETTER_AUTH_URL darauf – ohne Fixture
-        # würde der Mock-Curl "200" liefern (kein valides Skript) und die
+        # Selbstdiagnose-Fixture: die "aktuelle Rohdatei" mit URL-Logik.
+        # Der Installer prüft per grep BETTER_AUTH_TRUSTED_ORIGINS darauf – ohne
+        # Fixture würde der Mock-Curl "200" liefern (kein valides Skript) und die
         # Selbstdiagnose fälschlich warnen. Mit $HS/remote_without_auth_url
-        # simuliert der Testfall einen ALTEN Remote-Stand (ohne Zwei-URL-Logik).
+        # simuliert der Testfall einen ALTEN Remote-Stand (ohne URL-Logik).
         if [[ -f "$HS/remote_without_auth_url" ]]; then
             cat <<'REMOTESTALE'
 #!/usr/bin/env bash
@@ -416,7 +416,7 @@ REMOTESTALE
             cat <<'REMOTEFIX'
 #!/usr/bin/env bash
 INSTALLER_VERSION="9.9.9"
-BETTER_AUTH_URL="http://127.0.0.1:1515"
+BETTER_AUTH_TRUSTED_ORIGINS="http://127.0.0.1:1515"
 REMOTEFIX
         fi
         exit 0 ;;
@@ -471,7 +471,12 @@ case "$sub" in
                     printf 'postgres running\nweb running\nworker %s\ndb-migrate exited\n' "$worker_state"
                 fi
                 exit 0 ;;
-            logs)   echo "mock-compose-log-line"; exit 0 ;;
+            logs)
+                # Boot-500-Simulation (Live 2026-11-24): web loggt den MCP-HTTPS-Fehler
+                if [[ -f "$HS/web_mcp_500" ]]; then
+                    echo "web-1  | Error: APP_URL must be an HTTPS URL (or localhost) to serve MCP: an access token is bound to http://10.120.5.42:1515/api/mcp. Got http://10.120.5.42:1515."
+                fi
+                echo "mock-compose-log-line"; exit 0 ;;
             *)      exit 0 ;;
         esac ;;
     *) echo "mock-docker: $sub (ignored)"; exit 0 ;;
@@ -637,9 +642,10 @@ APP_ICON=/icons/elmo-icon.svg
 VITE_APP_NAME=Elmo
 VITE_APP_ICON=/icons/elmo-icon.svg
 DATABASE_URL=postgres://postgres:postgres@postgres:5432/elmo
-APP_URL=http://10.120.5.42:1515
-VITE_APP_URL=http://10.120.5.42:1515
+APP_URL=http://127.0.0.1:1515
+VITE_APP_URL=http://127.0.0.1:1515
 BETTER_AUTH_URL=http://127.0.0.1:1515
+BETTER_AUTH_TRUSTED_ORIGINS=http://127.0.0.1:1515,http://10.120.5.42:1515
 DISABLE_TELEMETRY=1
 SCRAPE_TARGETS=chatgpt:cloro:online,google-ai-mode:cloro:online
 ENVSEED
@@ -757,9 +763,10 @@ assert_fcontains "$ENV_PATH" "APP_ICON=/icons/elmo-icon.svg"
 assert_fcontains "$ENV_PATH" "DATABASE_URL=postgres://postgres:postgres@postgres:5432/elmo"
 assert_fcontains "$ENV_PATH" "DISABLE_TELEMETRY=1"
 assert_fcontains "$ENV_PATH" "SCRAPE_TARGETS=stub:stub:online"
-assert_fregex "$ENV_PATH" '^APP_URL=http://'"$CT_IP"':1515$'
-assert_fregex "$ENV_PATH" '^VITE_APP_URL=http://'"$CT_IP"':1515$'
+assert_fregex "$ENV_PATH" '^APP_URL=http://127.0.0.1:1515$'
+assert_fregex "$ENV_PATH" '^VITE_APP_URL=http://127.0.0.1:1515$'
 assert_fregex "$ENV_PATH" '^BETTER_AUTH_URL=http://127.0.0.1:1515$'
+assert_fregex "$ENV_PATH" '^BETTER_AUTH_TRUSTED_ORIGINS=http://127.0.0.1:1515,http://'"$CT_IP"':1515$'
 assert_fcontains "$ENV_PATH" "TYPESAFE_API_KEY=stub"
 assert_no_fcontains "$ENV_PATH" "OPENROUTER_API_KEY"
 env_mode=$(/bin/stat -c '%a' "$ENV_PATH" 2>/dev/null || echo "?")
@@ -776,21 +783,22 @@ assert_fcontains "$UNIT_PATH" "After=network-online.target docker.service"
 assert_fcontains "$UNIT_PATH" "Requires=docker.service"
 assert_fcontains "$UNIT_PATH" "WantedBy=multi-user.target"
 
-t "Sync-Script: APP_URL=IP + BETTER_AUTH_URL=Loopback + Domain-Guard"
+t "Sync-Script: APP_URL=Loopback + LAN-Origin in BETTER_AUTH_TRUSTED_ORIGINS + Domain-Guard"
 assert_file "$SYNC_PATH"
 assert_fcontains "$SYNC_PATH" 'BASH_SOURCE[0]'
-assert_fcontains "$SYNC_PATH" "127.0.0.1"   # BETTER_AUTH_URL wird auf Loopback gepinnt
+assert_fcontains "$SYNC_PATH" "127.0.0.1"   # APP_URL wird auf Loopback gepinnt
 assert_fcontains "$SYNC_PATH" "https://*"    # https://-APP_URL wird nicht überschrieben
 assert_fcontains "$SYNC_PATH" "set_key APP_URL"
-assert_fcontains "$SYNC_PATH" "set_key BETTER_AUTH_URL"
-assert_fcontains "$SYNC_PATH" "eth0"         # APP_URL = echte CT-IP-Origin
+assert_fcontains "$SYNC_PATH" "set_key BETTER_AUTH_TRUSTED_ORIGINS"
+assert_fcontains "$SYNC_PATH" "eth0"         # LAN-IP landet in TRUSTED_ORIGINS
 
 t "Install mit --port 4545"
 reset_state
 ec=$(run_installer --port 4545); assert_exit 0 "$ec"
 assert_fcontains "$COMPOSE_PATH" '"4545:3000"'
-assert_fregex "$ENV_PATH" '^APP_URL=http://'"$CT_IP"':4545$'
+assert_fregex "$ENV_PATH" '^APP_URL=http://127.0.0.1:4545$'
 assert_fregex "$ENV_PATH" '^BETTER_AUTH_URL=http://127.0.0.1:4545$'
+assert_fregex "$ENV_PATH" '^BETTER_AUTH_TRUSTED_ORIGINS=http://127.0.0.1:4545,http://'"$CT_IP"':4545$'
 assert_out "http://$CT_IP:4545"
 
 t "Install mit --telemetry"
@@ -856,24 +864,28 @@ echo "192.168.178.77" > "$HS/ct_ip"   # mock-ip/sync liefert die statische IP
 ec=$(run_installer --ip 192.168.178.77/24 --gateway 192.168.178.1); assert_exit 0 "$ec"
 assert_fcontains "$HS/ct_200.create" "ip=192.168.178.77/24,gateway=192.168.178.1"
 assert_out "http://192.168.178.77:1515"
-assert_fregex "$ENV_PATH" '^APP_URL=http://192.168.178.77:1515$'
+assert_fregex "$ENV_PATH" '^APP_URL=http://127.0.0.1:1515$'
 assert_fregex "$ENV_PATH" '^BETTER_AUTH_URL=http://127.0.0.1:1515$'
+assert_fregex "$ENV_PATH" '^BETTER_AUTH_TRUSTED_ORIGINS=http://127.0.0.1:1515,http://192.168.178.77:1515$'
 
-t "Invalid-origin-Regression: APP_URL = echte CT-IP, BETTER_AUTH_URL = Loopback"
+t "Boot-500-Regression (Live 2026-11-24): APP_URL=Loopback, LAN-Origin nur in TRUSTED_ORIGINS"
 reset_state
 ec=$(run_installer); assert_exit 0 "$ec"
-# Better Auth vertraut der echten Origin (Login vom LAN), MCP sieht Loopback:
-assert_fregex "$ENV_PATH" '^APP_URL=http://'"$CT_IP"':1515$'
+# elmo 0.7.12 liest APP_URL || VITE_APP_URL als Auth-baseURL; die MCP-Resource-ID
+# akzeptiert nur https/Loopback – eine LAN-IP in APP_URL wäre Boot-500. Deshalb
+# APP_URL=Loopback; der LAN-Login klappt über BETTER_AUTH_TRUSTED_ORIGINS:
+assert_fregex "$ENV_PATH" '^APP_URL=http://127.0.0.1:1515$'
+assert_fregex "$ENV_PATH" '^VITE_APP_URL=http://127.0.0.1:1515$'
 assert_fregex "$ENV_PATH" '^BETTER_AUTH_URL=http://127.0.0.1:1515$'
-assert_no_fcontains "$ENV_PATH" "APP_URL=http://127.0.0.1"
+assert_fregex "$ENV_PATH" '^BETTER_AUTH_TRUSTED_ORIGINS=http://127.0.0.1:1515,http://'"$CT_IP"':1515$'
 
-t "Selbstdiagnose: Remote-Rohdatei ohne BETTER_AUTH_URL → STALE-CACHE-Warnung"
+t "Selbstdiagnose: Remote-Rohdatei ohne BETTER_AUTH_TRUSTED_ORIGINS → STALE-CACHE-Warnung"
 reset_state
-touch "$HS/remote_without_auth_url"   # mock-curl liefert Fixture ohne BETTER_AUTH_URL
+touch "$HS/remote_without_auth_url"   # mock-curl liefert Fixture ohne URL-Logik
 ec=$(run_installer); assert_exit 0 "$ec"
 assert_out "STALE-CACHE VERDACHT"
-assert_out "Zwei-URL-Logik"           # Hinweis auf die fehlende Zwei-URL-Logik
-# Gegenprobe: mit intakter Remote-Fixture (BETTER_AUTH_URL drin) KEINE Warnung
+assert_out "URL-Logik"                # Hinweis auf die fehlende URL-Logik
+# Gegenprobe: mit intakter Remote-Fixture (TRUSTED_ORIGINS drin) KEINE Warnung
 reset_state
 ec=$(run_installer); assert_exit 0 "$ec"
 assert_no_out "STALE-CACHE VERDACHT"
@@ -890,6 +902,13 @@ touch "$HS/worker_down"
 ec=$(run_installer); assert_exit 0 "$ec"
 assert_out "Worker läuft nicht (Status prüfen)"
 assert_out "docker compose logs --tail 50 worker"
+
+t "Install: web-Boot-500 (APP_URL=LAN-IP, Live 2026-11-24) → gezielter Fix-Hinweis"
+reset_state
+touch "$HS/fail_web" "$HS/web_mcp_500"   # Web-UI 000 + MCP-HTTPS-Fehler im web-Log
+ec=$(run_installer); assert_exit 1 "$ec"
+assert_out "must be an HTTPS URL"
+assert_out "sync-app-url.sh"
 
 t "Install: CT existiert bereits → die() mit Update-Hinweis"
 reset_state
@@ -982,9 +1001,19 @@ assert_docker 1 "pull"
 assert_fcontains "$ENV_PATH" "BETTER_AUTH_SECRET=deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 assert_fcontains "$ENV_PATH" "DEPLOYMENT_ID=11111111-2222-3333-4444-555555555555"
 assert_fcontains "$ENV_PATH" "SCRAPE_TARGETS=chatgpt:cloro:online,google-ai-mode:cloro:online"
-assert_fregex "$ENV_PATH" '^APP_URL=http://'"$CT_IP"':1515$'
+assert_fregex "$ENV_PATH" '^APP_URL=http://127.0.0.1:1515$'
 assert_fregex "$ENV_PATH" '^BETTER_AUTH_URL=http://127.0.0.1:1515$'
+assert_fregex "$ENV_PATH" '^BETTER_AUTH_TRUSTED_ORIGINS=http://127.0.0.1:1515,http://'"$CT_IP"':1515$'
 assert_out "Update abgeschlossen – Daten (Postgres-Volume) blieben erhalten."
+
+t "--update: Legacy-APP_URL (LAN-IP, v1.0.9) wird auf Loopback + TRUSTED_ORIGINS migriert"
+seed_ct
+/bin/sed -i 's|^APP_URL=.*|APP_URL=http://'"$CT_IP"':1515|; s|^VITE_APP_URL=.*|VITE_APP_URL=http://'"$CT_IP"':1515|' "$ENV_PATH"
+ec=$(run_installer --update); assert_exit 0 "$ec"
+assert_fregex "$ENV_PATH" '^APP_URL=http://127.0.0.1:1515$'
+assert_fregex "$ENV_PATH" '^VITE_APP_URL=http://127.0.0.1:1515$'
+assert_fregex "$ENV_PATH" '^BETTER_AUTH_URL=http://127.0.0.1:1515$'
+assert_fregex "$ENV_PATH" '^BETTER_AUTH_TRUSTED_ORIGINS=http://127.0.0.1:1515,http://'"$CT_IP"':1515$'
 
 t "--update auf gestopptem CT → startet ihn selbst (Grube 10)"
 seed_ct
@@ -1059,7 +1088,8 @@ ec=$(run_installer --status); assert_exit 0 "$ec"
 assert_out "Container:  200 (running) – elmo"
 assert_out "Service:   elmo läuft (systemctl is-active)"
 assert_out "Stack:     postgres running web running worker running"
-assert_out "APP_URL:   http://10.120.5.42:1515"
+assert_out "APP_URL:   http://127.0.0.1:1515"
+assert_out "Trusted:   http://127.0.0.1:1515,http://10.120.5.42:1515"
 assert_out "Scrape:    chatgpt:cloro:online,google-ai-mode:cloro:online"
 assert_out "LLM-Key:   NICHT gesetzt"
 assert_out "Missing environment configuration"
@@ -1110,3 +1140,4 @@ if [[ "$FAILED" -gt 0 ]]; then
     exit 1
 fi
 exit 0
+
