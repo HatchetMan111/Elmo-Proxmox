@@ -85,7 +85,7 @@ bash -c "$(wget --no-cache --no-cookies --header="Cache-Control: no-cache" -qLO 
 inkl. „LLM-Key“ (Onboarding/Opportunities) und „Scraper“ (echte Engine-Antworten).
 
 `SCRAPE_TARGETS` bestimmt, welche Engines getrackt werden (Format
-`modell:provider[:version][:online]`, kommasepariert). Default: **`stub:main`**
+`modell:provider[:version][:online]`, kommasepariert). Default: **`stub:stub:online`**
 (der keyless-„Stub“-Provider – der Worker bootet damit garantiert ohne API-Keys,
 antwortet aber nur mit dem Prompt selbst, „no network“). **Wichtig:** Jeder
 Provider in `SCRAPE_TARGETS` braucht beim Boot seinen Key (sonst verweigert der
@@ -97,24 +97,32 @@ Worker den Start und crash-looped). Echte Targets:
     --scrape-targets "chatgpt:openrouter:openai/gpt-5-mini:online,google-ai-mode:openrouter:openai/gpt-5-mini:online"
 ```
 
-## Web-UI, Login & APP_URL (Zwei-URL-Aufteilung)
+## Web-UI, Login & APP_URL (Loopback-Pin + Trusted Origins)
 
-Elmo hat zwei gegenläufige URL-Zwänge, die der Installer automatisch auflöst:
+Elmo 0.7.12 hat zwei gegenläufige URL-Zwänge, die der Installer automatisch auflöst
+(korrigiert in Installer v1.0.10 – die frühere „Zwei-URL-Aufteilung“ mit LAN-IP in
+`APP_URL` war falsch und endete im Live-Boot-500 vom 2026-11-24):
 
-1. **MCP-Auth** (`packages/lib/src/auth/server.ts:mcpResource`) verlangt für ihre
-   Resource-ID zwingend `https://` **oder** `localhost`/`127.x` – im Container ist
-   `NODE_ENV=production`, „localhost“ greift also nicht. Die Auth-`baseURL`
-   (`APP_URL || BETTER_AUTH_URL`) muss loopback-akzeptiert sein, sonst Boot-500.
-2. **Better Auth** prüft beim Login/Registrieren die Browser-Origin gegen
-   `APP_URL` (trustedOrigins) – ist `APP_URL` ein Loopback, scheitert **jeder**
-   Login/Registrierung vom LAN mit **„Invalid origin“** (Live-Grube 2026-11-22).
+1. **MCP-Auth** (`packages/lib/src/auth/server.ts:mcpResource`) liest die Auth-
+   `baseURL` aus **`APP_URL || VITE_APP_URL`** (`BETTER_AUTH_URL` wird von elmo
+   0.7.12 *nicht* gelesen!) und akzeptiert für ihre Resource-ID nur `https://`
+   **oder** `localhost`/`127.x`. Ist `APP_URL` eine LAN-IP (`http://<CT-IP>:<PORT>`),
+   bootet `web` mit **HTTP 500**: „APP_URL must be an HTTPS URL (or localhost) …“.
+2. **Better Auth** prüft beim Login/Registrieren die Browser-Origin gegen die
+   trustedOrigins – ohne die LAN-Origin in **`BETTER_AUTH_TRUSTED_ORIGINS`**
+   scheitert **jeder** Login/Registrierung vom LAN mit **„Invalid origin“**
+   (Live-Grube 2026-11-22).
 
-Lösung: **`APP_URL` = echte Origin** (`http://<CT-IP>:<PORT>`) und
-**`BETTER_AUTH_URL` = Loopback** (`http://127.0.0.1:<PORT>`) – erfüllt beides
-(web bootet, Login vom LAN klappt; Email/Login-Redirects sind relativ). Für den
-**MCP-Server** oder saubere Links `APP_URL=https://deine-domain.example` in
-`/opt/elmo/.env` setzen (Reverse-Proxy/TLS) – der IP-Sync erkennt `https://` und
-greift dann nicht mehr.
+Lösung (Installer ≥ v1.0.10): **`APP_URL` / `VITE_APP_URL` / `BETTER_AUTH_URL` =
+Loopback** (`http://127.0.0.1:<PORT>`) – web bootet garantiert, die MCP-Resource-ID
+ist loopback-akzeptiert. Die LAN-Origin `http://<CT-IP>:<PORT>` wandert per
+`sync-app-url.sh` (läuft als `ExecStartPre` vor jedem Stack-Start) in
+**`BETTER_AUTH_TRUSTED_ORIGINS`** (`http://127.0.0.1:<PORT>,http://<CT-IP>:<PORT>`)
+– Login/Registrierung vom LAN klappt. Bestehende Installationen (v1.0.9 mit LAN-IP
+in `APP_URL`) migriert `sync-app-url.sh` beim `--update` automatisch auf Loopback +
+Trusted Origins. Für externe MCP-Clients oder saubere Links
+`APP_URL=https://deine-domain.example` in `/opt/elmo/.env` setzen
+(Reverse-Proxy/TLS) – der Sync erkennt `https://` und greift dann nicht mehr.
 
 ## Update
 
@@ -144,7 +152,8 @@ Exit-Code, Log-Auszüge, Container-Logs) und bleibt zur Inspektion stehen
 ```
 ┌─ LXC „elmo“ (unprivileged, Docker-in-LXC) ─────────────────┐
 │  systemd: elmo.service (Restart=always, ExecStartPre       │
-│            sync-app-url.sh → APP_URL = CT-IP, AUTH = Loopback) │
+│            sync-app-url.sh → APP_URL = Loopback, LAN-Origin →    │
+│                              BETTER_AUTH_TRUSTED_ORIGINS)         │
 │                                                            │
 │  docker compose (name: elmo):                              │
 │   postgres   postgres:18-alpine      intern (KEIN Expose)  │
@@ -160,9 +169,9 @@ Exit-Code, Log-Auszüge, Container-Logs) und bleibt zur Inspektion stehen
 ## Domain-Modus (Reverse-Proxy, optional)
 
 Setze in `/opt/elmo/.env` `APP_URL=https://elmo.beispiel.de` (und `VITE_APP_URL`
-ebenso) – der Loopback-Pin beim Boot erkennt `https://` und greift dann **nicht mehr**,
-deine Domain bleibt erhalten. Dahinter kannst du einen Reverse-Proxy deiner Wahl
-hängen.
+ebenso) – `sync-app-url.sh` erkennt beim Boot `https://` und greift dann **nicht
+mehr**, deine Domain bleibt erhalten. Dahinter kannst du einen Reverse-Proxy deiner
+Wahl hängen.
 
 ## Backup
 
@@ -175,3 +184,4 @@ Alle getrackten Antworten/Konfigurationen liegen im Docker-Volume `postgres_data
 ## Lizenz
 
 MIT – siehe [LICENSE](LICENSE). Elmo selbst: MIT ([elmohq/elmo](https://github.com/elmohq/elmo)).
+
