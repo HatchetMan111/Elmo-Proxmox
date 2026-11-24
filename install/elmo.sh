@@ -40,7 +40,7 @@
 set -Eeuo pipefail
 
 # ── Defaults ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="1.0.10"  # wird in --status/-Logs ausgegeben – hilft bei Fehlersuche
+INSTALLER_VERSION="1.0.11"  # wird in --status/-Logs ausgegeben – hilft bei Fehlersuche
 APP_NAME="elmo"
 UPSTREAM_OWNER="elmohq"
 UPSTREAM_REPO="elmo"
@@ -1258,6 +1258,82 @@ do_uninstall() {
 }
 
 # ── Status ─────────────────────────────────────────────────────────────────
+# ── Env-Check wie die elmo-UI ───────────────────────────────────────────────
+# Repliziert elmo 0.7.12 getEnvValidationState() (packages/config/src/env.ts +
+# env-registry.ts) für DEPLOYMENT_MODE=local – exakt die Liste, die die Web-UI
+# über getEnvValidationStateFn als "Missing environment configuration" rendert.
+# Hinweis: die UI zählt über withStoredCredentials() auch in der DB gespeicherte
+# Provider-Keys; hier zählen nur .env-Keys (relevant für frische Installs).
+env_get() { # CT_ID KEY → Wert aus /opt/elmo/.env (leer = nicht gesetzt)
+    pct exec "$1" -- sed -n "s/^$2=//p" "${APP_DIR}/.env" 2>/dev/null | head -1 || true
+}
+elmo_env_check() {
+    local ct_id="$1" k prov key need scrape target
+    local -a keys=(DATABASE_URL BETTER_AUTH_SECRET SCRAPE_TARGETS ELMO_ENCRYPTION_KEY DEPLOYMENT_MODE \
+        ONBOARDING_LLM_TARGET DATAFORSEO_LOGIN DATAFORSEO_PASSWORD OPENAI_API_KEY ANTHROPIC_API_KEY \
+        MISTRAL_API_KEY SEARCHAPI_API_KEY OLOSTEP_API_KEY BRIGHTDATA_API_TOKEN OXYLABS_USERNAME \
+        OXYLABS_PASSWORD CLORO_API_KEY OPENROUTER_API_KEY)
+    local -A is_set=()
+    for k in "${keys[@]}"; do
+        [[ -n "$(env_get "$ct_id" "$k")" ]] && is_set[$k]=1
+    done
+    scrape=$(env_get "$ct_id" SCRAPE_TARGETS)
+    target=$(env_get "$ct_id" ONBOARDING_LLM_TARGET)
+
+    local -a missing=()
+    # 1) statische local-Requirements (env-registry.ts: requiredBy enthält "local")
+    for k in DATABASE_URL BETTER_AUTH_SECRET SCRAPE_TARGETS ELMO_ENCRYPTION_KEY DEPLOYMENT_MODE; do
+        [[ -n "${is_set[$k]:-}" ]] || missing+=("$k")
+    done
+    # 2) Provider-Keys aus SCRAPE_TARGETS (Format model:provider[:version][:online])
+    local -A provkeys=(
+        [dataforseo]="DATAFORSEO_LOGIN + DATAFORSEO_PASSWORD"
+        [openai-api]="OPENAI_API_KEY" [anthropic-api]="ANTHROPIC_API_KEY"
+        [mistral-api]="MISTRAL_API_KEY" [searchapi]="SEARCHAPI_API_KEY"
+        [olostep]="OLOSTEP_API_KEY" [brightdata]="BRIGHTDATA_API_TOKEN"
+        [oxylabs]="OXYLABS_USERNAME + OXYLABS_PASSWORD" [cloro]="CLORO_API_KEY"
+        [openrouter]="OPENROUTER_API_KEY"
+    )
+    local -A seen=()
+    if [[ -n "$scrape" ]]; then
+        while IFS= read -r prov; do
+            [[ -z "$prov" || -n "${seen[$prov]:-}" ]] && continue
+            seen[$prov]=1
+            need="${provkeys[$prov]:-}"
+            [[ -z "$need" ]] && continue   # z. B. provider "stub": keine Keys nötig
+            local allset=1
+            for key in ${need// +/ }; do [[ -z "${is_set[$key]:-}" ]] && allset=0; done
+            (( allset )) || missing+=("$need (SCRAPE_TARGETS provider \"$prov\")")
+        done < <(tr ',' '\n' <<<"$scrape" | awk -F: '{print $2}')
+    fi
+    # 3) Research-Provider (Onboarding + Opportunities): RESEARCH_PROVIDER_PREFERENCE
+    #    = openai-api, openrouter, anthropic-api, mistral-api – sonst ONBOARDING_LLM_TARGET
+    local research_ok=0
+    for key in OPENAI_API_KEY OPENROUTER_API_KEY ANTHROPIC_API_KEY MISTRAL_API_KEY; do
+        [[ -n "${is_set[$key]:-}" ]] && research_ok=1
+    done
+    if (( ! research_ok )) && [[ -n "$target" ]]; then
+        prov=$(head -1 <<<"$target" | awk -F: '{print $2}')
+        need="${provkeys[$prov]:-}"
+        if [[ -n "$need" ]]; then
+            local tset=1
+            for key in ${need// +/ }; do [[ -z "${is_set[$key]:-}" ]] && tset=0; done
+            (( tset )) && research_ok=1
+        fi
+    fi
+    (( research_ok )) || missing+=("OPENAI_API_KEY or OPENROUTER_API_KEY or ANTHROPIC_API_KEY or MISTRAL_API_KEY (Onboarding/Opportunities – alternativ ONBOARDING_LLM_TARGET + Provider-Key)")
+
+    if [[ ${#missing[@]} -eq 0 ]]; then
+        ok "Env-Check:  alle elmo-Requirements erfüllt (UI zeigt kein 'Missing environment configuration')"
+    else
+        warn "Env-Check:  fehlende Env-Vars – die UI zeigt dann 'Missing environment configuration':"
+        for k in "${missing[@]}"; do
+            warn "             ✘ $k"
+        done
+        warn "             Fix: ${ONE_LINER} --update --onboarding-key sk-or-v1-... (LLM) bzw. Provider-Keys in ${APP_DIR}/.env"
+    fi
+}
+
 do_status() {
     header "📊 Status Elmo"
     info "Installer-Version: v${INSTALLER_VERSION} | Image-Pin: ${ELMO_VERSION}"
@@ -1359,6 +1435,8 @@ do_status() {
         warn "           ChatGPT-/Gemini-/Google-AI-Antworten). Keys: CLORO_API_KEY,"
         warn "           BRIGHTDATA_API_TOKEN, SEARCHAPI_API_KEY, OLOSTEP_API_KEY, ..."
     fi
+
+    elmo_env_check "$ct_id"
 
     local ip code=""
     ip=$(get_ct_ip "$ct_id")
